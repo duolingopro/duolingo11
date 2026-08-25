@@ -1,6 +1,7 @@
 # ================================================================
 # duolingo_bot_ultimate_hybrid_fixed.py
 # FULL CODE - FIX XP 900+ (success rate) + STREAK 0.3-0.4/s + GEMS
+# FIX: Progress riêng cho từng user, không bị đè, mỗi user task riêng
 # ================================================================
 
 from dotenv import load_dotenv
@@ -571,56 +572,60 @@ def can_add_task(user_id: int) -> bool:
     current_tasks = len(user_tasks.get(str_user_id, []))
     return current_tasks < limits["max_tasks"]
 
-# ================== PROGRESS TRACKER (Realtime Update) ==================
-_progress_lock = threading.Lock()
-_progress = {
-    'type': None,
-    'done': 0,
-    'total': 0,
-    'speed': 0.0,
-    'elapsed': 0.0,
-    'status': 'idle',
-    'message': ''
-}
+# ================== PROGRESS TRACKER (RIÊNG CHO TỪNG USER) ==================
+_user_progress_lock = threading.Lock()
+_user_progress = {}  # user_id -> dict
 
-def update_progress(type_: str, done: int, total: int, speed: float = 0.0, elapsed: float = 0.0, status: str = 'running', message: str = ''):
-    with _progress_lock:
-        _progress['type'] = type_
-        _progress['done'] = done
-        _progress['total'] = total
-        _progress['speed'] = speed
-        _progress['elapsed'] = elapsed
-        _progress['status'] = status
-        _progress['message'] = message
+def update_user_progress(user_id: str, type_: str, done: int, total: int, speed: float = 0.0, elapsed: float = 0.0, status: str = 'running', message: str = ''):
+    with _user_progress_lock:
+        if user_id not in _user_progress:
+            _user_progress[user_id] = {}
+        _user_progress[user_id]['type'] = type_
+        _user_progress[user_id]['done'] = done
+        _user_progress[user_id]['total'] = total
+        _user_progress[user_id]['speed'] = speed
+        _user_progress[user_id]['elapsed'] = elapsed
+        _user_progress[user_id]['status'] = status
+        _user_progress[user_id]['message'] = message
 
-async def progress_updater(interaction: discord.Interaction, stop_event: asyncio.Event):
+def get_user_progress(user_id: str) -> dict:
+    with _user_progress_lock:
+        return _user_progress.get(user_id, {}).copy()
+
+def clear_user_progress(user_id: str):
+    with _user_progress_lock:
+        if user_id in _user_progress:
+            del _user_progress[user_id]
+
+async def progress_updater(interaction: discord.Interaction, user_id: str, stop_event: asyncio.Event):
     while not stop_event.is_set():
-        with _progress_lock:
-            p = _progress.copy()
-        if p['status'] == 'idle':
+        p = get_user_progress(user_id)
+        if not p or p.get('status') == 'idle':
             await asyncio.sleep(1)
             continue
 
         embed = discord.Embed(
-            title=f"⏳ ĐANG {p['type'].upper()}",
+            title=f"⏳ ĐANG {p.get('type', '').upper()}",
             color=discord.Color.blue()
         )
-        if p['type'] == 'xp':
+        if p.get('type') == 'xp':
             embed.title = "⚡ ĐANG CÀY XP"
-            desc = f"🎯 **{p['done']:,} / {p['total']:,} XP**"
-        elif p['type'] == 'gems':
+            desc = f"🎯 **{p.get('done', 0):,} / {p.get('total', 0):,} XP**"
+        elif p.get('type') == 'gems':
             embed.title = "💎 ĐANG FARM GEMS"
-            desc = f"💎 **{p['done']:,} / {p['total']:,} gems**"
-        elif p['type'] == 'streak':
+            desc = f"💎 **{p.get('done', 0):,} / {p.get('total', 0):,} gems**"
+        elif p.get('type') == 'streak':
             embed.title = "🔥 ĐANG BUFF STREAK"
-            desc = f"📆 **{p['done']:,} / {p['total']:,} ngày**"
+            desc = f"📆 **{p.get('done', 0):,} / {p.get('total', 0):,} ngày**"
         else:
             desc = "Đang xử lý..."
 
-        if p['elapsed'] > 0:
-            desc += f"\n⏱️ **{p['elapsed']:.1f}s** | 🚀 **{p['speed']:.1f} /s**"
-        if p['message']:
-            desc += f"\n{p['message']}"
+        elapsed = p.get('elapsed', 0)
+        speed = p.get('speed', 0)
+        if elapsed > 0:
+            desc += f"\n⏱️ **{elapsed:.1f}s** | 🚀 **{speed:.1f} /s**"
+        if p.get('message'):
+            desc += f"\n{p.get('message')}"
         embed.description = desc
         embed.set_footer(text="Hybrid Bot")
 
@@ -868,7 +873,7 @@ class QuestHelper:
         except:
             return False
 
-# ================== LỚP DUOLINGO TỐC ĐỘ CAO (XP) - FIX THEO PHONG CÁCH BÊN PHẢI ==================
+# ================== LỚP DUOLINGO TỐC ĐỘ CAO (XP) ==================
 class AsyncDuolingo:
     STORY_SLUGS = [
         "fr-en-le-passeport", "vi-en-le-passeport", "es-en-le-passeport",
@@ -893,7 +898,6 @@ class AsyncDuolingo:
         }
         self.from_lang = "vi"
         self.learn_lang = "en"
-        # Các biến thống kê (giữ để tương thích)
         self.xp_before = 0
         self.total_earned = 0
         self.success_rate = 0
@@ -922,13 +926,12 @@ class AsyncDuolingo:
             "masterVersion": True,
             "score": 0,
             "maxScore": 0,
-            "happyHourBonusXp": max(0, target_xp - 30),  # Cho phép tối đa 469 bonus
+            "happyHourBonusXp": max(0, target_xp - 30),
             "startTime": now - dur,
             "endTime": now
         }
 
     async def _send_story_request(self, session: aiohttp.ClientSession, target_xp: int, custom_time: int = None, retries: int = 3) -> int:
-        """Gửi request story – theo phong cách bên phải (đơn giản, nhanh)"""
         slug = random.choice(self.STORY_SLUGS)
         url = f"https://stories.duolingo.com/api2/stories/{slug}/complete"
         payload = self._generate_payload(target_xp, custom_time)
@@ -966,7 +969,6 @@ class AsyncDuolingo:
         return 0
 
     async def farm_xp(self, target_xp: int, progress_callback=None) -> Tuple[int, float, float]:
-        """Farm XP tốc độ cao – dùng một session, không proxy, giống bên phải"""
         total_earned = 0
         start_time = time.time()
         lock = asyncio.Lock()
@@ -974,7 +976,6 @@ class AsyncDuolingo:
         self.total_attempts = 0
         self.successful_attempts = 0
 
-        # Lấy XP ban đầu (tuỳ chọn, để đối chiếu)
         self.xp_before = await self._get_current_xp()
         logger.info(f"📊 XP ban đầu: {self.xp_before:,}")
 
@@ -1013,7 +1014,6 @@ class AsyncDuolingo:
                 await asyncio.sleep(self.sleep)
 
         async with aiohttp.ClientSession(headers=self._get_headers(), connector=connector, timeout=timeout) as session:
-            # Task log tốc độ (đơn giản)
             async def logger_task():
                 last_log = 0
                 while True:
@@ -1034,7 +1034,6 @@ class AsyncDuolingo:
             await asyncio.gather(*workers)
             log_bg.cancel()
 
-        # Lấy XP sau khi farm (để đối chiếu)
         xp_after = await self._get_current_xp()
         actual_gained = xp_after - self.xp_before
         if actual_gained > 0:
@@ -1047,7 +1046,7 @@ class AsyncDuolingo:
         logger.info(f"✅ Farm XP hoàn tất: +{total_earned:,} XP trong {total_time:.1f}s ({avg_speed:.1f} XP/s)")
         return total_earned, total_time, avg_speed
 
-# ================== SELENIUM DRIVER MANAGER (giữ nguyên) ==================
+# ================== SELENIUM DRIVER MANAGER ==================
 _selenium_driver = None
 _driver_lock = threading.Lock()
 
@@ -1111,7 +1110,7 @@ def send_request_via_selenium(token: str, method: str, url: str, data: dict = No
             time.sleep(0.1)
     return None
 
-# ================== LỚP CURL_DUOLINGO (giữ nguyên) ==================
+# ================== LỚP CURL_DUOLINGO ==================
 class CurlDuolingo:
     def __init__(self, token: str):
         self.token = token
@@ -2532,6 +2531,7 @@ async def stop_task(interaction: discord.Interaction):
                 task.cancel()
         await asyncio.sleep(0.5)
         user_tasks[user_id] = []
+        clear_user_progress(user_id)
         await interaction.response.send_message(f"⏹️ Đã dừng **{count}** task!", ephemeral=True)
     else:
         await interaction.response.send_message("❌ Không có task nào đang chạy.", ephemeral=True)
@@ -2762,26 +2762,28 @@ async def sync_commands(interaction: discord.Interaction, guild_id: str = None):
             ephemeral=True
         )
 
-# ================== HÀM FARM (cập nhật realtime) ==================
+# ================== HÀM FARM (cập nhật realtime riêng cho từng user) ==================
 async def farm_xp_hybrid(interaction: discord.Interaction, token: str, target_xp: int, user_id_int: int):
     user_id = str(interaction.user.id)
     role = get_role(user_id_int)
     
-    update_progress('xp', 0, target_xp, 0, 0, 'running')
+    # Khởi tạo progress riêng cho user này
+    update_user_progress(user_id, 'xp', 0, target_xp, 0, 0, 'running')
     stop_event = asyncio.Event()
-    updater_task = asyncio.create_task(progress_updater(interaction, stop_event))
+    updater_task = asyncio.create_task(progress_updater(interaction, user_id, stop_event))
     
     start = time.time()
     duo = AsyncDuolingo(token, concurrency=get_user_limits(user_id_int)["concurrency"], sleep=get_user_limits(user_id_int)["sleep"])
     
     def progress_callback(done, total, elapsed):
         speed = done / elapsed if elapsed > 0 else 0
-        update_progress('xp', done, total, speed, elapsed, 'running')
+        update_user_progress(user_id, 'xp', done, total, speed, elapsed, 'running')
     
     gained, elapsed, speed = await duo.farm_xp(target_xp, progress_callback)
     
     stop_event.set()
     await updater_task
+    clear_user_progress(user_id)
     
     embed = discord.Embed(
         title="🎉 CÀY XP HOÀN TẤT!" if gained > 0 else "⚠️ Không có XP",
@@ -2812,9 +2814,9 @@ async def farm_gems_hybrid(interaction: discord.Interaction, token: str, target_
     user_id = str(interaction.user.id)
     role = get_role(interaction.user.id)
     
-    update_progress('gems', 0, target_gems, 0, 0, 'running')
+    update_user_progress(user_id, 'gems', 0, target_gems, 0, 0, 'running')
     stop_event = asyncio.Event()
-    updater_task = asyncio.create_task(progress_updater(interaction, stop_event))
+    updater_task = asyncio.create_task(progress_updater(interaction, user_id, stop_event))
     
     start = time.time()
     loop = asyncio.get_running_loop()
@@ -2825,7 +2827,7 @@ async def farm_gems_hybrid(interaction: discord.Interaction, token: str, target_
     def progress_callback(done, total):
         elapsed = time.time() - start
         speed = done / elapsed if elapsed > 0 else 0
-        update_progress('gems', done, total, speed, elapsed, 'running')
+        update_user_progress(user_id, 'gems', done, total, speed, elapsed, 'running')
     
     try:
         gained = await loop.run_in_executor(
@@ -2848,6 +2850,7 @@ async def farm_gems_hybrid(interaction: discord.Interaction, token: str, target_
     
     stop_event.set()
     await updater_task
+    clear_user_progress(user_id)
     
     embed = discord.Embed(
         title="🎉 FARM GEMS HOÀN TẤT!" if gained > 0 else "⚠️ Không tăng gems",
@@ -2878,9 +2881,9 @@ async def buff_streak_hybrid(interaction: discord.Interaction, token: str, targe
     user_id = str(interaction.user.id)
     role = get_role(user_id_int)
     
-    update_progress('streak', 0, target_count, 0, 0, 'running')
+    update_user_progress(user_id, 'streak', 0, target_count, 0, 0, 'running')
     stop_event = asyncio.Event()
-    updater_task = asyncio.create_task(progress_updater(interaction, stop_event))
+    updater_task = asyncio.create_task(progress_updater(interaction, user_id, stop_event))
     
     start = time.time()
     loop = asyncio.get_running_loop()
@@ -2891,7 +2894,7 @@ async def buff_streak_hybrid(interaction: discord.Interaction, token: str, targe
     def progress_callback(done, total):
         elapsed = time.time() - start
         speed = done / elapsed if elapsed > 0 else 0
-        update_progress('streak', done, total, speed, elapsed, 'running')
+        update_user_progress(user_id, 'streak', done, total, speed, elapsed, 'running')
     
     try:
         total_gained = await loop.run_in_executor(
@@ -2914,6 +2917,7 @@ async def buff_streak_hybrid(interaction: discord.Interaction, token: str, targe
     
     stop_event.set()
     await updater_task
+    clear_user_progress(user_id)
     
     embed = discord.Embed(
         title=f"🔥 BUFF STREAK HOÀN TẤT! +{total_gained} ngày",
